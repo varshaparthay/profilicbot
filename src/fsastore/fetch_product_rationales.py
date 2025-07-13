@@ -16,16 +16,20 @@ with open("/Users/varsha/src/projects/poc_eligiblity/fsa_products.csv", newline=
         eligibility = row["Eligibility"]
         print(f"Calling prompt for: {website}")
 
+        input_str = (
+            f"website: {website}\n"
+            f"Eligibility label: {eligibility}\n"
+        )
+
         # Pass product and eligibility as prompt variables/inputs
         try:
             response = client.responses.create(
                 prompt={
                     "id": PROMPT_ID,
-                    "version": "4"
+                    "version": "6"
                 },
                 input=website,
             )
-            print(f"Response: {response}")
             openai_output = response.output[-1].content[0].text
         except Exception as e:
             openai_output = f"ERROR: {e}"
