@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 import openai
 
 # Replace with your actual OpenAI API key
-api_key = "[REDACTED]"
+api_key = os.getenv("OPENAI_API_KEY")
 client = openai.OpenAI(api_key=api_key)
 
 # Fetch and parse page content, handling Cloudflare
