@@ -7,7 +7,7 @@ import json
 import re
 
 # Initialize OpenAI client
-api_key = "[REDACTED]"
+api_key = os.getenv("OPENAI_API_KEY")
 client = openai.OpenAI(api_key=api_key)
 
 # Step 1: Fetch and parse the page content
