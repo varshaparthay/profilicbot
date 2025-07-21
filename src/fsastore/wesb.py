@@ -31,13 +31,26 @@ def fetch_page_content(url: str) -> (str, str):
         html = resp.text
 
     soup = BeautifulSoup(html, "html.parser")
-    # Extract product name
+    # Extract product name with fallbacks
     h1 = soup.find("h1")
-    name = h1.get_text().strip() if h1 else ""
+    if h1 and h1.get_text().strip():
+        name = h1.get_text().strip()
+    else:
+        meta = soup.find("meta", property="og:title") or soup.find(
+            "meta", attrs={"name": "title"}
+        )
+        name = meta["content"].strip() if meta and meta.get("content") else ""
 
     # Gather visible text elements
     elems = soup.find_all(["h1", "h2", "h3", "p", "li"])
     text_parts = [e.get_text().strip() for e in elems if e.get_text().strip()]
+
+    # Include meta description if present
+    meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find(
+        "meta", property="og:description"
+    )
+    if meta_desc and meta_desc.get("content"):
+        text_parts.append(meta_desc["content"].strip())
 
     # Include table content (e.g., supplement facts)
     for table in soup.find_all("table"):
