@@ -1,0 +1,806 @@
+{
+  "categories": [
+    {
+      "name": "Addiction & Substance Abuse",
+      "description": "Services and products related to alcoholism, substance misuse, and recovery programs.",
+      "keywords": [
+        "alcohol",
+        "substance abuse",
+        "addiction",
+        "drug",
+        "rehabilitation",
+        "AA",
+        "substance",
+        "alcoholism"
+      ]
+    },
+    {
+      "name": "Cosmetic Surgery & Procedures",
+      "description": "Procedures and treatments primarily intended to improve appearance rather than address a medical condition.",
+      "keywords": [
+        "abdominoplasty",
+        "cosmetic",
+        "blepharoplasty",
+        "plastic",
+        "surgery",
+        "appearance",
+        "cosmetic surgery",
+        "bleaching",
+        "whitening",
+        "tummy tuck"
+      ]
+    },
+    {
+      "name": "Pain Relief & Analgesics",
+      "description": "Medications and therapies used to relieve pain, reduce inflammation, or alleviate fever.",
+      "keywords": [
+        "acetaminophen",
+        "analgesic",
+        "aspirin",
+        "pain",
+        "anti-inflammatory",
+        "fever",
+        "antipyretic",
+        "ache"
+      ]
+    },
+    {
+      "name": "Digestive Health",
+      "description": "Products and treatments for digestive issues like heartburn, indigestion, gas, diarrhea, and stomach discomfort.",
+      "keywords": [
+        "acid",
+        "antacid",
+        "stomach",
+        "heartburn",
+        "anti-diarrheal",
+        "anti gas",
+        "diarrhea",
+        "gas",
+        "digestive",
+        "ulcers",
+        "constipation",
+        "laxative"
+      ]
+    },
+    {
+      "name": "Dermatology & Skin Care",
+      "description": "Medical skin care products and treatments for acne, dermatitis, fungal infections, itching, and other skin conditions.",
+      "keywords": [
+        "acne",
+        "blemish",
+        "pimple",
+        "blackhead",
+        "skin",
+        "fungal",
+        "itch",
+        "cream",
+        "lotion",
+        "ointment",
+        "psoriasis",
+        "eczema",
+        "dermatitis",
+        "peptide",
+        "retinol",
+        "hyaluronic",
+        "collagen",
+        "ninacinamide",
+        "lipids",
+        "anti-aging",
+        "anti-wrinkle",
+        "vitamin C",
+        "Brightening",
+        "Sun damage",
+        "cold sores",
+        "Psoriasis",
+        "Lesions/Warts/Abrasions",
+        "toners"
+      ]
+    },
+    {
+      "name": "Holistic & Alternative Medicine",
+      "description": "Non-traditional medical practices and devices such as acupuncture, acupressure, and other alternative therapies.",
+      "keywords": [
+        "acupressure",
+        "acupuncture",
+        "alternative",
+        "herbal",
+        "homeopathic",
+        "naturopath",
+        "aromatherapy",
+        "holistic",
+        "massage"
+      ]
+    },
+    {
+      "name": "Medical Equipment & Supplies",
+      "description": "Medical devices, monitoring equipment, and essential healthcare supplies for diagnosis and treatment.",
+      "keywords": [
+        "adaptive equipment",
+        "wheelchair",
+        "blood pressure",
+        "glucose",
+        "monitor",
+        "thermometer",
+        "AED",
+        "defibrillator",
+        "oxygen",
+        "CPAP",
+        "nebulizer",
+        "brace",
+        "sling",
+        "support",
+        "stethoscope",
+        "medical device",
+        "equipment"
+      ]
+    },
+    {
+      "name": "Mental Health & Behavioral",
+      "description": "Services and treatments that support mental health, psychological well-being, and behavioral therapy.",
+      "keywords": [
+        "behavioral",
+        "mental",
+        "counseling",
+        "therapy",
+        "psychologist",
+        "therapist",
+        "psychiatric",
+        "antidepressant",
+        "depression"
+      ]
+    },
+    {
+      "name": "Child & Dependent Care",
+      "description": "Fees and services related to child or dependent care that are not medical treatments.",
+      "keywords": [
+        "adoption",
+        "child care",
+        "babysitting",
+        "after-school",
+        "agency fee",
+        "day care",
+        "child care program",
+        "babysitting",
+        "child care"
+      ]
+    },
+    {
+      "name": "Environmental & Air Quality",
+      "description": "Household products that improve air quality or provide comfort when medically necessary.",
+      "keywords": [
+        "air conditioner",
+        "air filter",
+        "air purifier",
+        "humidifier",
+        "dehumidifier",
+        "air quality",
+        "air cleaner"
+      ]
+    },
+    {
+      "name": "Transportation & Travel for Care",
+      "description": "Transportation costs related to obtaining medical treatment, including airfare and mileage.",
+      "keywords": [
+        "transportation",
+        "airfare",
+        "travel",
+        "mileage",
+        "bus fare",
+        "taxi",
+        "meeting",
+        "uber",
+        "ride"
+      ]
+    },
+    {
+      "name": "Weight Management & Bariatric",
+      "description": "Weight-loss surgeries and programs addressing obesity and weight management.",
+      "keywords": [
+        "bariatric",
+        "weight",
+        "obesity",
+        "gastric",
+        "behavioral modification",
+        "weight management"
+      ]
+    },
+    {
+      "name": "Sanitizers & Antimicrobials",
+      "description": "Products that kill or prevent the spread of germs and bacteria for hygienic or medical use.",
+      "keywords": [
+        "sanitizer",
+        "antibacterial",
+        "antiseptic",
+        "disinfectant",
+        "antimicrobial",
+        "hand sanitizer"
+      ]
+    },
+    {
+      "name": "Mobility Aids & Supports",
+      "description": "Devices and garments that support movement or stabilize joints and muscles.",
+      "keywords": [
+        "ankle brace",
+        "arm sling",
+        "back brace",
+        "arch support",
+        "brace",
+        "compression",
+        "anti-embolism",
+        "socks",
+        "stockings",
+        "arthritis gloves",
+        "support"
+      ]
+    },
+    {
+      "name": "Respiratory & Allergy",
+      "description": "Medications and devices for allergies, asthma, and other respiratory conditions.",
+      "keywords": [
+        "allergy",
+        "antihistamine",
+        "respiratory",
+        "asthma",
+        "inhaler",
+        "decongestant",
+        "nasal",
+        "histamine"
+      ]
+    },
+    {
+      "name": "Reproductive & Fertility",
+      "description": "Services and supplies related to fertility treatments, artificial reproduction, and reproductive health.",
+      "keywords": [
+        "artificial insemination",
+        "fertility",
+        "IVF",
+        "insemination",
+        "reproduction",
+        "egg",
+        "sperm",
+        "contraception",
+        "birth control",
+        "pregnancy test"
+      ]
+    },
+    {
+      "name": "Hearing & Audiology",
+      "description": "Devices and services for diagnosing and treating hearing conditions.",
+      "keywords": [
+        "hearing aid",
+        "audiologist",
+        "hearing",
+        "cochlear"
+      ]
+    },
+    {
+      "name": "Vision & Eye Care",
+      "description": "Services, devices, and products for maintaining eye health and correcting vision.",
+      "keywords": [
+        "bifocals",
+        "glasses",
+        "contact",
+        "eye",
+        "vision",
+        "spectacles",
+        "ocular"
+      ]
+    },
+    {
+      "name": "Dental & Orthodontic Care",
+      "description": "Dental treatments and orthodontic services for oral health.",
+      "keywords": [
+        "dental",
+        "dentist",
+        "tooth",
+        "teeth",
+        "braces",
+        "orthodontist",
+        "oral"
+      ]
+    },
+    {
+      "name": "Nutritional Supplements & Vitamins",
+      "description": "Vitamins, supplements, and nutritional products for addressing specific deficiencies or dietary needs.",
+      "keywords": [
+        "biotin",
+        "boost",
+        "choline",
+        "chondroitin",
+        "collagen",
+        "electrolyte",
+        "ensure",
+        "fiber",
+        "glucosamine",
+        "hydration",
+        "nutrition",
+        "omega 3",
+        "omega-3",
+        "prenatal",
+        "prenatal protein",
+        "prenatal+",
+        "protein",
+        "supplement",
+        "vitamins"
+      ]
+    },
+    {
+      "name": "Sexual Health & Contraception",
+      "description": "Products and services for sexual health and contraceptive needs.",
+      "keywords": [
+        "condom",
+        "contraceptive",
+        "birth control",
+        "sexual",
+        "morning-after",
+        "lubricant"
+      ]
+    },
+    {
+      "name": "Women’s Health",
+      "description": "Products specifically addressing women’s health, including feminine hygiene, pregnancy, and postpartum care.",
+      "keywords": [
+        "feminine",
+        "menstrual",
+        "tampons",
+        "pads",
+        "pregnancy",
+        "postpartum",
+        "breast pump",
+        "nursing",
+        "maternity",
+        "prenatal"
+      ]
+    },
+    {
+      "name": "Men’s Health",
+      "description": "Products specifically addressing men’s health conditions, such as prostate or fertility.",
+      "keywords": [
+        "prostate",
+        "testosterone",
+        "erectile",
+        "men's health"
+      ]
+    },
+    {
+      "name": "Infant & Baby Care",
+      "description": "Products designed for infants and babies, including feeding, hygiene, and monitoring.",
+      "keywords": [
+        "baby",
+        "infant",
+        "formula",
+        "diaper",
+        "bottle",
+        "rash",
+        "sunscreen",
+        "stroller",
+        "breast",
+        "monitor",
+        "baby bottle"
+      ]
+    },
+    {
+      "name": "Family Planning & Parenting",
+      "description": "Services and supplies to support family planning and parenting needs that are not medical treatments.",
+      "keywords": [
+        "family planning",
+        "parenting",
+        "birthing",
+        "childbirth",
+        "birthing coach",
+        "adoption fee",
+        "agency fee"
+      ]
+    },
+    {
+      "name": "Funeral & Burial Expenses",
+      "description": "Costs associated with funerals, burials, and related services.",
+      "keywords": [
+        "funeral",
+        "burial",
+        "cremation",
+        "mortuary"
+      ]
+    },
+    {
+      "name": "Fitness & Exercise Equipment",
+      "description": "Fitness equipment and accessories for exercise or physical therapy when medically required.",
+      "keywords": [
+        "exercise",
+        "fitness",
+        "gym",
+        "weights",
+        "treadmill",
+        "yoga",
+        "equipment",
+        "physiotherapy"
+      ]
+    },
+    {
+      "name": "Protective Equipment",
+      "description": "Personal protective equipment to reduce exposure to germs or injuries.",
+      "keywords": [
+        "mask",
+        "face shield",
+        "gloves",
+        "goggles",
+        "PPE",
+        "shield",
+        "protection"
+      ]
+    },
+    {
+      "name": "First Aid & Emergency Supplies",
+      "description": "Supplies and equipment used to treat minor injuries and emergency situations.",
+      "keywords": [
+        "bandage",
+        "first aid",
+        "gauze",
+        "adhesive",
+        "trauma",
+        "elastic",
+        "plaster",
+        "splint"
+      ]
+    },
+    {
+      "name": "Diagnostic & Monitoring Tests",
+      "description": "Tests and devices used to diagnose or monitor medical conditions.",
+      "keywords": [
+        "test",
+        "monitor",
+        "diagnostic",
+        "drug test",
+        "pregnancy test",
+        "COVID",
+        "cholesterol",
+        "lab",
+        "glucose monitor",
+        "oxygen monitor"
+      ]
+    },
+    {
+      "name": "Sleep & Snoring Aids",
+      "description": "Products and devices to alleviate sleep disorders, snoring, and related conditions.",
+      "keywords": [
+        "sleep",
+        "snore",
+        "CPAP",
+        "sleep apnea",
+        "sleep aid",
+        "anti-snore"
+      ]
+    },
+    {
+      "name": "Hospital & Clinical Services",
+      "description": "Medical services including hospital stays, surgeries, and emergency room care.",
+      "keywords": [
+        "hospital",
+        "surgery",
+        "anesthesia",
+        "emergency",
+        "doctor",
+        "clinic",
+        "ambulance",
+        "operating"
+      ]
+    },
+    {
+      "name": "Home Modifications & Accessibility",
+      "description": "Modifications to homes or vehicles that provide accessibility or safety.",
+      "keywords": [
+        "home modification",
+        "wheelchair ramp",
+        "lift",
+        "grab bar",
+        "rail",
+        "automobile modification"
+      ]
+    },
+    {
+      "name": "Miscellaneous Medical Services",
+      "description": "Various medical services and items that do not fit into other categories.",
+      "keywords": [
+        "autopsy",
+        "DNA",
+        "body scan",
+        "organ donation",
+        "miscellaneous"
+      ]
+    },
+    {
+      "name": "Vision Surgery & Correction",
+      "description": "Procedures and surgeries to correct or improve vision.",
+      "keywords": [
+        "lasik",
+        "cataract",
+        "eye surgery",
+        "vision surgery"
+      ]
+    },
+    {
+      "name": "Laboratory Services",
+      "description": "Laboratory tests and analyses used to diagnose health conditions.",
+      "keywords": [
+        "laboratory",
+        "lab",
+        "pathology",
+        "analysis",
+        "bloodwork"
+      ]
+    },
+    {
+      "name": "Massage & Physical Therapy",
+      "description": "Massage therapy and physical rehabilitation services.",
+      "keywords": [
+        "massage",
+        "physical therapy",
+        "physiotherapy",
+        "rehabilitation",
+        "chiropractic",
+        "chiropractor"
+      ]
+    },
+    {
+      "name": "Cognitive & Neurological Support",
+      "description": "Products and services supporting cognitive function, dementia, and neurological health.",
+      "keywords": [
+        "alzheimer",
+        "dementia",
+        "cognitive",
+        "neurology",
+        "memory",
+        "neurological"
+      ]
+    },
+    {
+      "name": "Speech & Occupational Therapy",
+      "description": "Therapy services for speech, occupational therapy, and rehabilitation.",
+      "keywords": [
+        "speech therapy",
+        "occupational therapy",
+        "language therapy",
+        "speech"
+      ]
+    },
+    {
+      "name": "Telemedicine & Virtual Care",
+      "description": "Medical services provided remotely via telehealth or virtual platforms.",
+      "keywords": [
+        "telemedicine",
+        "telehealth",
+        "virtual care",
+        "online doctor"
+      ]
+    },
+    {
+      "name": "Prosthetics & Orthotics",
+      "description": "Artificial limbs and devices that support or replace body parts.",
+      "keywords": [
+        "artificial limb",
+        "prosthetic",
+        "prosthesis",
+        "orthotic",
+        "insoles"
+      ]
+    },
+    {
+      "name": "Hair Loss",
+      "description": "Treatments for hair loss",
+      "keywords": [
+        "alopecia",
+        "hair loss",
+        "hair growth"
+      ]
+    },
+    {
+      "name": "Cardiac & Circulatory Health",
+      "description": "Products and services addressing heart health and circulation.",
+      "keywords": [
+        "cardiac",
+        "heart",
+        "circulation",
+        "cholesterol",
+        "blood pressure",
+        "AED",
+        "defibrillator"
+      ]
+    },
+    {
+      "name": "Diabetes Care",
+      "description": "Supplies and medications for managing diabetes.",
+      "keywords": [
+        "diabetes",
+        "diabetic",
+        "glucose",
+        "insulin",
+        "test strips"
+      ]
+    },
+    {
+      "name": "Prenatal & Maternity Care",
+      "description": "Products and services used during pregnancy and childbirth.",
+      "keywords": [
+        "prenatal",
+        "maternity",
+        "pregnant",
+        "postnatal",
+        "midwife",
+        "doula",
+        "birthing",
+        "birth"
+      ]
+    },
+    {
+      "name": "Vaccines & Immunizations",
+      "description": "Vaccinations and immunizations for preventing disease.",
+      "keywords": [
+        "vaccine",
+        "immunization",
+        "shot",
+        "immunize",
+        "flu shot"
+      ]
+    },
+    {
+      "name": "Infectious Disease Testing",
+      "description": "Tests used to detect infectious diseases like COVID-19 or HIV.",
+      "keywords": [
+        "COVID",
+        "HIV",
+        "STD",
+        "infectious",
+        "disease test"
+      ]
+    },
+    {
+      "name": "Prescription Medications",
+      "description": "Prescription drugs used to treat diagnosed medical conditions.",
+      "keywords": [
+        "prescription",
+        "rx",
+        "medication",
+        "antibiotic",
+        "antidepressant",
+        "antipsychotic",
+        "anticonvulsant"
+      ]
+    },
+    {
+      "name": "Over-the-Counter Medicines",
+      "description": "Non-prescription medicines for common health concerns.",
+      "keywords": [
+        "OTC",
+        "over-the-counter",
+        "medicine",
+        "drugstore",
+        "nonprescription"
+      ]
+    },
+    {
+      "name": "Cold & Immune Support",
+      "description": "Products that support the immune system and help manage cold or flu symptoms.",
+      "keywords": [
+        "immune",
+        "cold",
+        "flu",
+        "cough",
+        "syrup",
+        "lozenge",
+        "vitamin C"
+      ]
+    },
+    {
+      "name": "Gastrointestinal Health",
+      "description": "Products and treatments for gastrointestinal conditions not included elsewhere.",
+      "keywords": [
+        "bowel",
+        "colon",
+        "constipation",
+        "laxative",
+        "digest",
+        "IBS",
+        "gut"
+      ]
+    },
+    {
+      "name": "Oral Surgery & Procedures",
+      "description": "Surgical dental procedures and related treatments.",
+      "keywords": [
+        "oral surgery",
+        "extraction",
+        "root canal",
+        "implant"
+      ]
+    },
+    {
+      "name": "Post-Surgical & Recovery Care",
+      "description": "Supplies and services used for post-operative care and recovery.",
+      "keywords": [
+        "post-surgery",
+        "recovery",
+        "wound care",
+        "scar",
+        "compression",
+        "healing"
+      ]
+    },
+    {
+      "name": "Eye Care Medications",
+      "description": "Medications and solutions for treating eye conditions.",
+      "keywords": [
+        "eye drops",
+        "ocular",
+        "ophthalmic",
+        "tear",
+        "dry eye"
+      ]
+    },
+    {
+      "name": "Sleep Aids & Insomnia Treatments",
+      "description": "Medications and products that help address insomnia and sleep issues.",
+      "keywords": [
+        "sleep aid",
+        "melatonin",
+        "insomnia",
+        "sedative"
+      ]
+    },
+    {
+      "name": "Neurological & Seizure Treatments",
+      "description": "Products and medications for neurological conditions and seizure disorders.",
+      "keywords": [
+        "anti-seizure",
+        "epilepsy",
+        "neurological",
+        "nerve",
+        "seizure"
+      ]
+    },
+    {
+      "name": "Blood Pressure & Cardiac Monitoring",
+      "description": "Devices and medications used for monitoring or treating blood pressure and heart health.",
+      "keywords": [
+        "blood pressure monitor",
+        "BP monitor",
+        "cardiac monitor",
+        "heart monitor",
+        "pulse"
+      ]
+    },
+    {
+      "name": "Wound Care & Bandaging",
+      "description": "Supplies used for treating wounds and protecting healing areas.",
+      "keywords": [
+        "wound",
+        "bandage",
+        "dressing",
+        "gauze",
+        "plaster",
+        "adhesive",
+        "bandages"
+      ]
+    },
+    {
+      "name": "Hormonal Treatments",
+      "description": "Medications used for hormone therapy or hormonal regulation.",
+      "keywords": [
+        "hormone",
+        "estrogen",
+        "testosterone",
+        "progesterone"
+      ]
+    },
+    {
+      "name": "Antimicrobial & Antiviral Treatments",
+      "description": "Medications used to treat or prevent infections caused by microbes or viruses.",
+      "keywords": [
+        "antiviral",
+        "antifungal",
+        "antiparasitic",
+        "antiparasite",
+        "anti-parasitic"
+      ]
+    }
+  ]
+}
