@@ -1,0 +1,22 @@
+Classify this product into the most appropriate category from the list below:
+
+Product: {{PRODUCT_NAME}}
+Description: {{PRODUCT_DESCRIPTION}}
+Brand: {{PRODUCT_BRAND}}
+Features: {{PRODUCT_FEATURES}}
+
+Available Categories:
+{{CATEGORIES_LIST}}
+
+CRITICAL CONSTRAINT: You must ONLY use category names from this exact list. Do NOT create or invent new categories.
+
+VALID CATEGORIES ONLY:
+[{{VALID_CATEGORY_NAMES}}]
+
+If you use ANY category name not in the above list, the system will fail.
+
+Respond with JSON:
+{
+    "primary_category": "MUST_BE_EXACT_MATCH_FROM_LIST_ABOVE",
+    "reasoning": "Brief explanation of why this category was chosen from the valid list",
+}

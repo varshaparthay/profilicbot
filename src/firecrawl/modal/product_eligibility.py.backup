@@ -1,0 +1,3868 @@
+#!/usr/bin/env python3
+"""
+Product Eligibility Pipeline - Individual Stage Deployment
+Clean deployment with separate functions for each pipeline stage
+"""
+
+import modal
+
+# Image with required dependencies and mounted prompts directory  
+image = (
+    modal.Image.debian_slim(python_version="3.13")
+    .pip_install([
+        "requests",
+        "pandas", 
+        "openai",
+        "firecrawl-py",
+        "pydantic",
+        "beautifulsoup4",
+        "python-dotenv",
+        "turbopuffer",
+        "boto3",
+        "fastapi[standard]",  # Required for web endpoints
+        "aiohttp",  # Required for async HTTP requests in hybrid discovery
+        "brotli"   # Required for brotli compression support
+    ])
+    .add_local_dir("/Users/varsha/src/profilicbot/src/prompts", remote_path="/prompts")
+)
+
+# Create new app for product eligibility
+app = modal.App("product-eligibility", image=image)
+
+# Secrets
+secrets = [
+    modal.Secret.from_name("aws-s3-credentials"),
+    modal.Secret.from_name("firecrawl-api-key"),
+    modal.Secret.from_name("openai-api-key"),
+    modal.Secret.from_name("turbopuffer-api-key")
+]
+
+# =============================================================================
+# STAGE 1: DISCOVERY (Queue-Based)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048,   # 2GB memory for discovery processing
+    max_containers=20
+)
+def discovery_worker(execution_id: str, environment: str, base_url: str):
+    """
+    Discovery worker - processes URLs from discovery queue
+    """
+    import uuid
+    import time
+    import requests
+    from bs4 import BeautifulSoup
+    import boto3
+    import json
+    from modal import Queue
+    
+    print(f"DISCOVERY WORKER STARTED - {execution_id}")
+    
+    try:
+        discovery_queue = Queue.from_name(f"discovery-{execution_id}", create_if_missing=True)
+        s3_client = boto3.client('s3')
+        
+        processed_count = 0
+        
+        while True:
+            try:
+                # Get URL to process from queue (30 second timeout)
+                queue_item = discovery_queue.get(timeout=60)
+                url_to_scrape = queue_item['url']
+                page_type = queue_item.get('type', 'product_page')
+                
+                print(f"   Processing: {url_to_scrape}")
+                
+                # Check if already processed (checkpoint)
+                url_hash = str(hash(url_to_scrape))[-8:]
+                checkpoint_key = f"{environment}/{execution_id}/checkpoints/discovery/{url_hash}.json"
+                
+                try:
+                    s3_client.head_object(Bucket='flex-ai', Key=checkpoint_key)
+                    print(f"   SKIPPING {url_to_scrape} - already processed")
+                    discovery_queue.task_done()
+                    continue
+                except:
+                    pass  # Not processed yet
+                
+                # Scrape the URL
+                headers = {'User-Agent': 'Mozilla/5.0 (compatible; ProductBot/1.0)'}
+                response = requests.get(url_to_scrape, headers=headers, timeout=60)
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                discovered_products = []
+                
+                # Extract product URLs
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    text = link.get_text().strip()
+                    
+                    if any(word in href.lower() for word in ['product', 'item', '/p/', '/products/']):
+                        if href.startswith('/'):
+                            href = base_url.rstrip('/') + href
+                        elif not href.startswith('http'):
+                            continue
+                            
+                        discovered_products.append({
+                            'url': href,
+                            'estimated_name': text[:100] if text else href.split('/')[-1],
+                            'discovered_from': url_to_scrape,
+                            'discovery_time': time.time(),
+                            'execution_id': execution_id
+                        })
+                
+                # Save checkpoint immediately
+                checkpoint_data = {
+                    'url_processed': url_to_scrape,
+                    'products_found': len(discovered_products),
+                    'discovered_products': discovered_products,
+                    'processed_at': time.time(),
+                    'worker_id': str(uuid.uuid4())[:8]
+                }
+                
+                s3_client.put_object(
+                    Bucket='flex-ai',
+                    Key=checkpoint_key,
+                    Body=json.dumps(checkpoint_data, indent=2),
+                    ContentType='application/json'
+                )
+                
+                processed_count += 1
+                print(f"   DISCOVERED {len(discovered_products)} products from {url_to_scrape}")
+                print(f"   CHECKPOINTED: {checkpoint_key}")
+                
+                discovery_queue.task_done()
+                
+            except Exception as queue_error:
+                if "Empty" in str(queue_error):
+                    print(f"Discovery worker finished - processed {processed_count} URLs")
+                    break
+                else:
+                    print(f"   Error processing URL: {queue_error}")
+                    discovery_queue.task_done()
+                    continue
+                    
+    except Exception as e:
+        print(f"Discovery worker failed: {e}")
+        return {'status': 'failed', 'error': str(e)}
+    
+    return {'status': 'success', 'processed_count': processed_count}
+
+# =============================================================================
+# CSV DISCOVERY HELPER FUNCTION
+# =============================================================================
+def discover_urls_from_csv(csv_path: str, base_url: str, max_products: int, execution_id: str):
+    """
+    Discover product URLs from CSV containing product names
+    
+    Args:
+        csv_path: Path to CSV file with product names
+        base_url: Base website URL to search on
+        max_products: Maximum products to process
+        execution_id: Pipeline execution ID
+    
+    Returns:
+        List of discovered product links
+    """
+    import pandas as pd
+    import requests
+    from bs4 import BeautifulSoup
+    import time
+    import urllib.parse
+    
+    print(f"📄 Loading product names from CSV: {csv_path}")
+    
+    # Load CSV - assume it has a 'name' column
+    try:
+        if csv_path.startswith('s3://'):
+            import boto3
+            from io import StringIO
+            s3_client = boto3.client('s3')
+            bucket = csv_path.replace('s3://', '').split('/')[0]
+            key = '/'.join(csv_path.replace('s3://', '').split('/')[1:])
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+        else:
+            df = pd.read_csv(csv_path)
+            
+        print(f"✅ Loaded {len(df)} products from CSV")
+        
+        # Limit products if specified
+        if max_products and len(df) > max_products:
+            df = df.head(max_products)
+            print(f"🔢 Limited to {max_products} products")
+            
+    except Exception as e:
+        print(f"❌ Error loading CSV: {e}")
+        return []
+    
+    discovered_links = []
+    base_domain = base_url.rstrip('/')
+    
+    print(f"🔍 Searching for product URLs on {base_domain}...")
+    
+    for i, (_, row) in enumerate(df.iterrows()):
+        product_name = str(row.get('name', ''))
+        if not product_name or product_name == 'nan':
+            continue
+            
+        print(f"   {i+1}/{len(df)}: Searching for '{product_name[:50]}...'")
+        
+        try:
+            # Method 1: Try site search
+            search_query = urllib.parse.quote_plus(product_name)
+            search_url = f"{base_domain}/search?q={search_query}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(search_url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Look for product links in search results
+                # Common selectors for product links
+                product_selectors = [
+                    'a[href*="/product"]',
+                    'a[href*="/p/"]', 
+                    'a[href*="/item"]',
+                    'a[href*="/products/"]',
+                    '.product-item a',
+                    '.product-link',
+                    '[data-product-url]'
+                ]
+                
+                found_url = None
+                for selector in product_selectors:
+                    links = soup.select(selector)
+                    for link in links:
+                        href = link.get('href')
+                        if href:
+                            if href.startswith('/'):
+                                href = base_domain + href
+                            
+                            # Check if link text matches product name (fuzzy match)
+                            link_text = link.get_text().strip().lower()
+                            name_lower = product_name.lower()
+                            
+                            # Simple fuzzy matching - check if key words appear
+                            name_words = name_lower.split()[:3]  # First 3 words
+                            matches = sum(1 for word in name_words if word in link_text)
+                            
+                            if matches >= len(name_words) // 2 + 1:  # At least half the words match
+                                found_url = href
+                                break
+                    
+                    if found_url:
+                        break
+                
+                if found_url:
+                    print(f"     ✅ Found: {found_url}")
+                    discovered_links.append({
+                        'url': found_url,
+                        'estimated_name': product_name,
+                        'discovered_from': base_url,
+                        'discovery_time': time.time(),
+                        'execution_id': execution_id,
+                        'discovery_method': 'csv_search_discovery'
+                    })
+                else:
+                    print(f"     ❌ Not found in search results")
+            else:
+                print(f"     ❌ Search failed with status {response.status_code}")
+                
+        except Exception as e:
+            print(f"     ❌ Error searching for '{product_name}': {e}")
+        
+        # Small delay to be respectful
+        time.sleep(0.5)
+    
+    print(f"🎯 CSV Discovery completed: Found {len(discovered_links)} product URLs")
+    return discovered_links
+
+def discover_urls_from_csv_queue_based(csv_path: str, base_url: str, max_products: int, execution_id: str, environment: str):
+    """
+    Queue-based CSV discovery for large datasets (12K+ products)
+    """
+    import pandas as pd
+    import boto3
+    import time
+    from modal import Queue
+    from io import StringIO
+    
+    print(f"📄 QUEUE-BASED CSV DISCOVERY: Loading from {csv_path}")
+    
+    # Load CSV
+    try:
+        if csv_path.startswith('s3://'):
+            s3_client = boto3.client('s3')
+            bucket = csv_path.replace('s3://', '').split('/')[0]
+            key = '/'.join(csv_path.replace('s3://', '').split('/')[1:])
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+        else:
+            df = pd.read_csv(csv_path)
+            
+        print(f"✅ Loaded {len(df)} products from CSV")
+        
+        if max_products and len(df) > max_products:
+            df = df.head(max_products)
+            print(f"🔢 Limited to {max_products} products")
+            
+    except Exception as e:
+        print(f"❌ Error loading CSV: {e}")
+        return []
+    
+    # Calculate optimal workers
+    worker_config = calculate_optimal_workers(len(df), 'csv_discovery')
+    worker_count = worker_config['worker_count']
+    
+    print(f"DYNAMIC WORKER CALCULATION:")
+    print(f"   Queue Size: {len(df)}")
+    print(f"   Optimal Workers: {worker_count}")
+    print(f"   Products per Worker: ~{worker_config['products_per_worker']}")
+    print(f"   Estimated Time: {worker_config['estimated_time_minutes']} minutes")
+    print(f"   Stage: CSV product URL discovery")
+    
+    # Create discovery queue
+    discovery_queue = Queue.from_name(f"csv-discovery-{execution_id}", create_if_missing=True)
+    
+    # Queue all products
+    print(f"Queueing {len(df)} products for discovery...")
+    for i, (_, row) in enumerate(df.iterrows()):
+        product_name = str(row.get('name', ''))
+        if product_name and product_name != 'nan':
+            discovery_queue.put({
+                'product_id': f'csv_product_{i:06d}',
+                'product_name': product_name,
+                'base_url': base_url,
+                'execution_id': execution_id,
+                'environment': environment
+            })
+    
+    print(f"Starting {worker_count} CSV discovery workers...")
+    
+    # Start discovery workers
+    discovery_workers = []
+    for _ in range(worker_count):
+        worker = csv_discovery_worker.spawn(execution_id, base_url, environment)
+        discovery_workers.append(worker)
+    
+    # Send completion signals
+    print("Sending completion signals to discovery workers...")
+    for _ in range(worker_count):
+        discovery_queue.put({
+            'product_id': 'CSV_DISCOVERY_COMPLETE',
+            'stage': 'csv_discovery',
+            'execution_id': execution_id,
+            'signal': 'CSV_DISCOVERY_COMPLETE'
+        })
+    
+    # Wait for workers to complete
+    print("Waiting for CSV discovery workers to complete...")
+    for worker in discovery_workers:
+        worker.get()
+    
+    print("All CSV discovery workers completed!")
+    
+    # Collect results from S3
+    s3_client = boto3.client('s3')
+    discovered_links = []
+    
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket='flex-ai',
+            Prefix=f'{environment}/{execution_id}/csv_discovery/'
+        )
+        
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                if obj['Key'].endswith('.json'):
+                    try:
+                        response = s3_client.get_object(Bucket='flex-ai', Key=obj['Key'])
+                        import json
+                        result = json.loads(response['Body'].read().decode('utf-8'))
+                        if result.get('status') == 'success' and result.get('url'):
+                            discovered_links.append(result)
+                    except Exception as e:
+                        print(f"Error reading {obj['Key']}: {e}")
+    
+    except Exception as e:
+        print(f"Error collecting results: {e}")
+    
+    print(f"🎯 Queue-based CSV Discovery completed: Found {len(discovered_links)} product URLs")
+    return discovered_links
+
+# CSV Discovery Worker
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours
+    memory=2048,    # 2GB memory
+    max_containers=30
+)
+def csv_discovery_worker(execution_id: str, base_url: str, environment: str = "dev"):
+    """
+    CSV Discovery worker - searches for product URLs from product names
+    """
+    import requests
+    from bs4 import BeautifulSoup
+    import time
+    import urllib.parse
+    import uuid
+    import json
+    import boto3
+    
+    print(f"CSV DISCOVERY WORKER STARTED - {execution_id}")
+    worker_id = str(uuid.uuid4())[:8]
+    
+    try:
+        queue_name = f"csv-discovery-{execution_id}"
+        processed_count = 0
+        s3_client = boto3.client('s3')
+        base_domain = base_url.rstrip('/')
+        
+        while True:
+            try:
+                # Get work item from queue
+                work_item = queue_helper(queue_name, "get", timeout=60)
+                
+                if work_item is None:
+                    raise Exception("Empty")
+                
+                product_id = work_item['product_id']
+                
+                # Check for completion signal
+                if product_id == 'CSV_DISCOVERY_COMPLETE':
+                    print(f"[{worker_id}] Received CSV_DISCOVERY_COMPLETE signal - worker finished - processed {processed_count} products")
+                    break
+                
+                product_name = work_item['product_name']
+                print(f"   [{worker_id}] Searching for: {product_name[:50]}...")
+                
+                # Check if already processed (checkpoint)
+                output_path = f"{environment}/{execution_id}/csv_discovery/{product_id}.json"
+                try:
+                    s3_client.head_object(Bucket='flex-ai', Key=output_path)
+                    print(f"   [{worker_id}] SKIPPING {product_id} - already processed")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                except:
+                    pass  # Not processed yet
+                
+                # Search for product URL
+                try:
+                    search_query = urllib.parse.quote_plus(product_name)
+                    search_url = f"{base_domain}/search?q={search_query}"
+                    
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+                    
+                    response = requests.get(search_url, headers=headers, timeout=30)
+                    
+                    result = {
+                        'product_id': product_id,
+                        'product_name': product_name,
+                        'search_url': search_url,
+                        'status': 'not_found',
+                        'execution_id': execution_id,
+                        'worker_id': worker_id,
+                        'discovery_time': time.time()
+                    }
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                        
+                        # Look for product links
+                        product_selectors = [
+                            'a[href*="/product"]',
+                            'a[href*="/p/"]', 
+                            'a[href*="/item"]',
+                            'a[href*="/products/"]',
+                            '.product-item a',
+                            '.product-link'
+                        ]
+                        
+                        found_url = None
+                        for selector in product_selectors:
+                            links = soup.select(selector)
+                            for link in links:
+                                href = link.get('href')
+                                if href:
+                                    if href.startswith('/'):
+                                        href = base_domain + href
+                                    
+                                    # Fuzzy matching
+                                    link_text = link.get_text().strip().lower()
+                                    name_lower = product_name.lower()
+                                    name_words = name_lower.split()[:3]
+                                    matches = sum(1 for word in name_words if word in link_text)
+                                    
+                                    if matches >= len(name_words) // 2 + 1:
+                                        found_url = href
+                                        break
+                            
+                            if found_url:
+                                break
+                        
+                        if found_url:
+                            result.update({
+                                'url': found_url,
+                                'estimated_name': product_name,
+                                'discovered_from': base_url,
+                                'discovery_method': 'csv_queue_discovery',
+                                'status': 'success'
+                            })
+                            print(f"   [{worker_id}] ✅ Found: {found_url}")
+                        else:
+                            print(f"   [{worker_id}] ❌ Not found")
+                    else:
+                        print(f"   [{worker_id}] ❌ Search failed: {response.status_code}")
+                        result['error'] = f"Search failed with status {response.status_code}"
+                    
+                    # Save result to S3
+                    s3_client.put_object(
+                        Bucket='flex-ai',
+                        Key=output_path,
+                        Body=json.dumps(result, indent=2),
+                        ContentType='application/json'
+                    )
+                    
+                    processed_count += 1
+                    
+                    # Small delay to be respectful
+                    time.sleep(0.5)
+                    
+                except Exception as search_error:
+                    print(f"   [{worker_id}] ❌ Error searching: {search_error}")
+                    
+                    # Save error result
+                    error_result = {
+                        'product_id': product_id,
+                        'product_name': product_name,
+                        'status': 'error',
+                        'error': str(search_error),
+                        'execution_id': execution_id,
+                        'worker_id': worker_id,
+                        'discovery_time': time.time()
+                    }
+                    
+                    s3_client.put_object(
+                        Bucket='flex-ai',
+                        Key=output_path,
+                        Body=json.dumps(error_result, indent=2),
+                        ContentType='application/json'
+                    )
+                
+                queue_helper(queue_name, "task_done")
+                
+            except Exception as queue_error:
+                if "Empty" in str(queue_error):
+                    print(f"   [{worker_id}] Queue empty, waiting for more work...")
+                    time.sleep(5)
+                else:
+                    print(f"   [{worker_id}] Queue error: {queue_error}")
+                    time.sleep(1)
+    
+    except Exception as e:
+        print(f"CSV Discovery worker failed: {e}")
+        return {'status': 'failed', 'error': str(e)}
+    
+    return {'status': 'success', 'processed_count': processed_count}
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("aws-s3-credentials"),
+        modal.Secret.from_name("firecrawl-api-key")
+    ],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048     # 2GB memory for discovery stage processing
+)
+def discovery_stage(
+    base_url: str,
+    max_products: int = 50,
+    environment: str = "dev",
+    discovery_depth: int = 3,
+    execution_id: str = None,
+    discover_with_csv: str = None
+):
+    """
+    Stage 1: Product URL Discovery (Queue-Based)
+    
+    Args:
+        base_url: E-commerce site to scrape
+        max_products: Maximum products to discover
+        environment: dev or prod
+        discovery_depth: How many pages deep to crawl
+        discover_with_csv: Path to CSV file with product names (optional)
+    
+    Returns:
+        Dict with execution_id and discovered URLs count
+    """
+    import uuid
+    import time
+    import requests
+    from bs4 import BeautifulSoup
+    import boto3
+    from modal import Queue
+    
+    import uuid
+    if not execution_id:
+        execution_id = str(uuid.uuid4())[:8]
+    print(f"STAGE 1: DISCOVERY (QUEUE-BASED)")
+    print(f"Execution ID: {execution_id}")
+    print(f"Base URL: {base_url}")
+    print(f"Max Products: {max_products}")
+    print(f"Discovery Depth: {discovery_depth}")
+    
+    try:
+        print("Discovering product URLs...")
+        product_links = []
+        
+        # Check if CSV discovery mode is enabled
+        if discover_with_csv:
+            print(f"🔍 CSV DISCOVERY MODE: Using product names from {discover_with_csv}")
+            product_links = discover_urls_from_csv_queue_based(discover_with_csv, base_url, max_products, execution_id, environment)
+        
+        # Try sitemap discovery first (most comprehensive) - only if not using CSV mode
+        else:
+            try:
+                print("   Attempting sitemap discovery...")
+                
+                # First check robots.txt for actual sitemap locations
+                sitemap_urls = []
+                try:
+                    print("     Checking robots.txt for sitemap locations...")
+                    robots_response = requests.get(f"{base_url.rstrip('/')}/robots.txt", headers={'User-Agent': 'Mozilla/5.0 (compatible; ProductBot/1.0)'}, timeout=60)
+                    if robots_response.status_code == 200:
+                        for line in robots_response.text.split('\n'):
+                            if line.lower().startswith('sitemap:'):
+                                sitemap_url = line.split(':', 1)[1].strip()
+                                if 'product' in sitemap_url.lower():  # Prioritize product sitemaps
+                                    sitemap_urls.insert(0, sitemap_url)
+                                else:
+                                    sitemap_urls.append(sitemap_url)
+                    print(f"     Found {len(sitemap_urls)} sitemaps in robots.txt")
+                except Exception as robots_error:
+                    print(f"     Robots.txt check failed: {robots_error}")
+            
+                # Fallback to standard sitemap locations if robots.txt didn't work
+                if not sitemap_urls:
+                    sitemap_urls = [
+                        f"{base_url.rstrip('/')}/sitemap.xml",
+                        f"{base_url.rstrip('/')}/sitemap_products.xml", 
+                        f"{base_url.rstrip('/')}/product-sitemap.xml",
+                        f"{base_url.rstrip('/')}/sitemap_index.xml"
+                    ]
+            
+                # Universal exclude patterns for non-product pages
+                exclude_patterns = [
+                # Account/Auth pages
+                'login', 'signin', 'signup', 'register', 'account', 'profile',
+                # Shopping flow pages  
+                'cart', 'checkout', 'payment', 'shipping', 'order',
+                # Service pages
+                'gift-card', 'giftcard', 'rewards', 'loyalty', 'membership',
+                # Legal/Company pages
+                'terms', 'conditions', 'privacy', 'policy', 'legal',
+                'about', 'careers', 'press', 'investor', 'contact',
+                # Support/Help pages
+                'support', 'help', 'faq', 'customer-service',
+                # Content pages
+                'blog', 'news', 'article', 'story', 'learn', 'expert-advice',
+                # Utility pages
+                'search', 'sitemap', 'store-locator', 'locations', 'find-store',
+                'wishlist', 'favorites', 'compare', 'recently-viewed',
+                # Category/collection pages (these are too broad)
+                '/c/', '/s/', '/category/', '/collection/', '/brand/',
+                # Filter/sort URLs
+                '?', '#', 'filter=', 'sort=', 'page='
+                ]
+            
+                # Universal product indicators - look for individual product patterns
+                # Most e-commerce sites use these patterns for individual products
+                product_indicators = [
+                    '/product/', '/products/', '/item/', '/items/', '/p/',
+                    '/dp/', '/pd/', '/prod/', '/sku/', '/pid/', '/detail/',
+                    # Some sites use these for individual products
+                    '-p-', '-product-', '/buy/', '_p_'
+                ]
+            
+                headers = {'User-Agent': 'Mozilla/5.0 (compatible; ProductBot/1.0)'}
+            
+                for sitemap_url in sitemap_urls:
+                    try:
+                        print(f"     Checking {sitemap_url}")
+                        response = requests.get(sitemap_url, headers=headers, timeout=60)
+                        
+                        if response.status_code == 200:
+                            # Handle potentially gzipped sitemaps
+                            content = response.content
+                            if sitemap_url.lower().endswith('.gz'):
+                                try:
+                                    import gzip
+                                    content = gzip.decompress(content)
+                                    print(f"     Successfully decompressed gzipped sitemap")
+                                except Exception as gz_error:
+                                    print(f"     File has .gz extension but isn't gzipped, using as-is: {gz_error}")
+                                    content = response.content
+                        
+                        # Parse XML sitemap
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(content)
+                        
+                        # Handle both sitemap and sitemap index formats
+                        urls_found = []
+                        
+                        # Check for sitemap index (contains links to other sitemaps)
+                        for sitemap in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}sitemap'):
+                            loc = sitemap.find('{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
+                            if loc is not None:
+                                # This is a sitemap index, fetch individual sitemaps
+                                try:
+                                    sub_response = requests.get(loc.text, headers=headers, timeout=60)
+                                    if sub_response.status_code == 200:
+                                        # Handle potentially gzipped sub-sitemaps  
+                                        sub_content = sub_response.content
+                                        if loc.text.lower().endswith('.gz'):
+                                            try:
+                                                import gzip
+                                                sub_content = gzip.decompress(sub_content)
+                                            except Exception:
+                                                # Not actually gzipped despite .gz extension
+                                                sub_content = sub_response.content
+                                        sub_root = ET.fromstring(sub_content)
+                                        for url in sub_root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}url'):
+                                            loc_elem = url.find('{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
+                                            if loc_elem is not None:
+                                                urls_found.append(loc_elem.text)
+                                except Exception as e:
+                                    print(f"     Error fetching sub-sitemap {loc.text}: {e}")
+                                    continue
+                        
+                        # Check for direct URL entries
+                        for url in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}url'):
+                            loc = url.find('{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
+                            if loc is not None:
+                                urls_found.append(loc.text)
+                        
+                        # Filter URLs for products only
+                        for url in urls_found:
+                            url_lower = url.lower()
+                            
+                            # Skip if contains exclude patterns
+                            if any(pattern in url_lower for pattern in exclude_patterns):
+                                continue
+                            
+                            # Must contain at least one product indicator
+                            if any(indicator in url_lower for indicator in product_indicators):
+                                product_links.append({
+                                    'url': url,
+                                    'estimated_name': url.split('/')[-1].replace('-', ' ').replace('.html', ''),
+                                    'discovered_from': sitemap_url,
+                                    'discovery_time': time.time(),
+                                    'execution_id': execution_id,
+                                    'discovery_method': 'sitemap'
+                                })
+                                
+                                if len(product_links) >= max_products:
+                                    break
+                        
+                        if product_links:
+                            print(f"   Sitemap discovery found {len(product_links)} URLs from {sitemap_url}")
+                            break  # Found products, no need to try other sitemaps
+                        
+                except Exception as e:
+                    print(f"     Sitemap {sitemap_url} failed: {e}")
+                    continue
+            
+            if not product_links:
+                raise Exception("No products found in sitemaps")
+                
+        except Exception as sitemap_error:
+            print(f"   Sitemap discovery failed: {sitemap_error}")
+            print("   Using Firecrawl Link Discovery + Manual Fetch approach...")
+        
+            try:
+                import os
+                import asyncio
+                import aiohttp
+                from firecrawl import FirecrawlApp
+            
+            firecrawl = FirecrawlApp(api_key=os.environ.get("FIRECRAWL_API_KEY"))
+            
+            # Normalize the base URL for Firecrawl
+            normalized_url = base_url
+            if not normalized_url.startswith('http'):
+                normalized_url = f"https://{normalized_url}"
+            if not normalized_url.endswith('/'):
+                normalized_url = f"{normalized_url}/"
+            
+            print(f"   Using normalized URL: {normalized_url}")
+            
+            # Step 1: Use Firecrawl purely for URL discovery (50 pages max)
+            print(f"   Step 1: Firecrawl URL discovery (50 pages)...")
+            try:
+                    # Try the basic crawl_url call first (most compatible)
+                print(f"   Trying basic crawl_url parameters...")
+                result = firecrawl.crawl_url(
+                    normalized_url,
+                    limit=50
+                )
+                print(f"   Firecrawl completed. Result type: {type(result)}")
+                except Exception as basic_error:
+                print(f"   Basic crawl_url failed: {basic_error}")
+                    
+                    # Try with simplified scrape options
+                try:
+                    print(f"   Trying with simplified scrape_options...")
+                    result = firecrawl.crawl_url(
+                        normalized_url,
+                        limit=50,
+                        scrape_options={'formats': ['html']}
+                    )
+                    print(f"   Firecrawl completed. Result type: {type(result)}")
+                except Exception as simple_error:
+                    print(f"   Simplified crawl_url failed: {simple_error}")
+                        
+                        # Try without scrape_options entirely
+                    try:
+                        print(f"   Trying minimal crawl_url...")
+                        result = firecrawl.crawl_url(normalized_url, limit=50)
+                        print(f"   Firecrawl completed. Result type: {type(result)}")
+                    except Exception as minimal_error:
+                        print(f"   All Firecrawl attempts failed:")
+                        print(f"     Basic: {basic_error}")
+                        print(f"     Simple: {simple_error}")
+                        print(f"     Minimal: {minimal_error}")
+                        raise Exception(f"All Firecrawl API calls failed. Last error: {minimal_error}")
+                
+                # Handle CrawlStatusResponse - check if it's completed or needs polling
+                discovered_links = []
+                
+                print(f"   Processing CrawlStatusResponse...")
+                
+                # Check if result has immediate data
+                if hasattr(result, 'data') and result.data:
+                print(f"   Found immediate data: {len(result.data)} items")
+                    
+                    # Debug: show structure of first few items
+                for i, item in enumerate(result.data[:3]):
+                    print(f"   Item {i+1} type: {type(item)}")
+                    if hasattr(item, '__dict__'):
+                        print(f"   Item {i+1} attributes: {list(item.__dict__.keys())}")
+                            # Show some sample attribute values
+                        for attr, value in list(item.__dict__.items())[:5]:
+                            print(f"     {attr}: {type(value)} = {str(value)[:100]}")
+                    else:
+                        print(f"   Item {i+1} value: {str(item)[:100]}")
+                    
+                    # Extract URLs from FirecrawlDocument objects and markdown content
+                for item in result.data:
+                    url = None
+                        
+                        # Check if it's a FirecrawlDocument with URL attribute
+                    if hasattr(item, 'url') and item.url:
+                        url = item.url
+                    elif hasattr(item, 'source_url') and item.source_url:
+                        url = item.source_url
+                    elif hasattr(item, 'page_url') and item.page_url:
+                        url = item.page_url
+                        
+                        # If no direct URL, extract URLs from markdown content
+                    elif hasattr(item, 'markdown') and item.markdown:
+                            # Extract URLs from markdown links [text](url) and plain URLs
+                        import re
+                        markdown_text = item.markdown
+                            
+                            # Find markdown links [text](url)
+                        markdown_links = re.findall(r'\[.*?\]\((https?://[^\)]+)\)', markdown_text)
+                        for link in markdown_links:
+                            if normalized_url.replace('https://', '').replace('www.', '') in link:
+                                discovered_links.append(link)
+                            
+                            # Find plain URLs
+                        plain_urls = re.findall(r'https?://[^\s\)]+', markdown_text)
+                        for link in plain_urls:
+                            if normalized_url.replace('https://', '').replace('www.', '') in link:
+                                discovered_links.append(link)
+                            
+                            # ENHANCED: Extract product URLs from collection/category pages
+                            # Look for product path patterns in the markdown
+                        if any(collection_indicator in markdown_text.lower() for collection_indicator in 
+                              ['/collections/', '/products/', 'add to cart', 'quick shop', 'view product']):
+                                
+                                # Try to extract Shopify-style product URLs
+                            shopify_products = re.findall(r'/products/([a-zA-Z0-9\-]+)', markdown_text)
+                            base_domain = normalized_url.rstrip('/')
+                            for product_slug in shopify_products[:50]:  # Limit to avoid too many
+                                product_url = f"{base_domain}/products/{product_slug}"
+                                discovered_links.append(product_url)
+                                
+                                # Try to extract other e-commerce patterns
+                            ecommerce_patterns = [
+                                r'/product/([a-zA-Z0-9\-]+)',
+                                r'/item/([a-zA-Z0-9\-]+)', 
+                                r'/p/([a-zA-Z0-9\-]+)'
+                            ]
+                                
+                            for pattern in ecommerce_patterns:
+                                matches = re.findall(pattern, markdown_text)
+                                for match in matches[:20]:  # Limit per pattern
+                                    pattern_base = pattern.split('(')[0]  # Get the path part
+                                    product_url = f"{base_domain}{pattern_base}{match}"
+                                    discovered_links.append(product_url)
+                        
+                    if url and url != 'None':
+                        discovered_links.append(url)
+                    
+                    # Remove duplicates
+                discovered_links = list(set(discovered_links))
+                
+                # Check if we need to poll for completion (async crawl)
+                elif hasattr(result, 'id') and result.id:
+                print(f"   Crawl is async. Job ID: {result.id}")
+                print(f"   Status: {getattr(result, 'status', 'unknown')}")
+                    
+                    # Poll for completion
+                max_polls = 30  # Wait up to 5 minutes (30 * 10 seconds)
+                poll_count = 0
+                    
+                while poll_count < max_polls:
+                    try:
+                        print(f"   Polling attempt {poll_count + 1}/{max_polls}...")
+                        status_result = firecrawl.check_crawl_status(result.id)
+                            
+                        if hasattr(status_result, 'status'):
+                            print(f"   Crawl status: {status_result.status}")
+                                
+                            if status_result.status == 'completed' and hasattr(status_result, 'data'):
+                                print(f"   Crawl completed! Found {len(status_result.data)} pages")
+                                for item in status_result.data:
+                                    if isinstance(item, dict) and 'url' in item:
+                                        discovered_links.append(item['url'])
+                                break
+                            elif status_result.status == 'failed':
+                                print(f"   Crawl failed: {getattr(status_result, 'error', 'Unknown error')}")
+                                break
+                            else:
+                                print(f"   Still processing... waiting 10 seconds")
+                                import time
+                                time.sleep(10)
+                            
+                        poll_count += 1
+                            
+                    except Exception as poll_error:
+                        print(f"   Polling error: {poll_error}")
+                        break
+                    
+                if poll_count >= max_polls:
+                    print(f"   Timeout waiting for crawl completion")
+                
+                # Debug: show all available attributes
+                else:
+                print(f"   No data found. Available attributes:")
+                if hasattr(result, '__dict__'):
+                    for attr, value in result.__dict__.items():
+                        print(f"     {attr}: {type(value)} = {str(value)[:100]}")
+                
+                print(f"   Firecrawl discovered {len(discovered_links)} total URLs")
+                
+                if not discovered_links:
+                raise Exception("Firecrawl returned no URLs")
+                
+                # Step 2: Filter for product URLs
+                print(f"   Step 2: Filtering for product URLs...")
+                
+                def is_valuable_url(url):
+                """Generic filter - exclude obvious non-product pages while being permissive"""
+                url_lower = url.lower()
+                    
+                    # Must be from the same domain
+                base_domain = normalized_url.replace('https://', '').replace('www.', '').split('/')[0]
+                if base_domain not in url_lower:
+                    return False
+                    
+                    # Remove fragment identifiers (#) - they're usually not useful for scraping
+                if '#' in url:
+                    url = url.split('#')[0]
+                    url_lower = url.lower()
+                    
+                    # Skip empty URLs after fragment removal
+                if not url.strip() or url.strip() == 'https://' or url.strip() == 'http://':
+                    return False
+                    
+                    # Exclude static files and media
+                static_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', 
+                                   '.css', '.js', '.ico', '.pdf', '.zip', '.mp4', '.mp3']
+                if any(url_lower.endswith(ext) for ext in static_extensions):
+                    return False
+                    
+                    # Exclude media URLs with query parameters (like ?size=440)
+                if '/media/' in url_lower and '?' in url_lower:
+                    return False
+                    
+                    # Exclude obvious non-commerce pages
+                exclude_patterns = [
+                    'login', 'signin', 'signup', 'register', 'auth', 'logout',
+                    'privacy-policy', 'terms-of-service', 'cookie-policy', 'robots.txt',
+                    '/stores/', '/store-locator', '/locations/', '/careers', '/about',
+                    '/impact', '/stewardship', '/learn/expert-advice/bio/',  # Bio pages
+                    '/blog/wp-content/'  # Blog assets
+                ]
+                    
+                if any(pattern in url_lower for pattern in exclude_patterns):
+                    return False
+                    
+                    # Include everything else - commerce pages, categories, products
+                return True
+                
+                valuable_urls = [url for url in discovered_links if is_valuable_url(url)]
+                print(f"   Filtered to {len(valuable_urls)} valuable URLs (products + categories)")
+                
+                # Show sample of what was filtered out vs kept
+                if len(discovered_links) > 0:
+                print(f"   Sample discovered URLs:")
+                for i, url in enumerate(discovered_links[:5]):
+                    is_valuable = is_valuable_url(url)
+                    status = "✅ VALUABLE" if is_valuable else "❌ FILTERED"
+                    print(f"     {status}: {url}")
+                
+                if len(valuable_urls) > 0:
+                print(f"   Sample valuable URLs to fetch:")
+                for i, url in enumerate(valuable_urls[:5]):
+                    print(f"     {i+1}. {url}")
+                
+                if not valuable_urls:
+                print("   No valuable URLs found in discovered links")
+                print(f"   Sample URLs: {discovered_links[:5]}")
+                raise Exception("No valuable URLs discovered")
+                
+                # Step 3: Manual async fetch of valuable pages
+                print(f"   Step 3: Manual fetch of {min(len(valuable_urls), max_products)} valuable pages...")
+                
+                async def fetch_product(session, url, semaphore):
+                async with semaphore:
+                        # Add random delay to avoid being detected as bot
+                    import random
+                    await asyncio.sleep(random.uniform(0.5, 2.0))
+                        
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                                # Rotate User-Agent strings
+                            user_agents = [
+                                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/91.0.864.59',
+                                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15'
+                            ]
+                                
+                            headers = {
+                                'User-Agent': random.choice(user_agents),
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                                'Accept-Language': 'en-US,en;q=0.5',
+                                'Accept-Encoding': 'gzip, deflate, br',
+                                'DNT': '1',
+                                'Connection': 'keep-alive',
+                                'Upgrade-Insecure-Requests': '1',
+                                'Sec-Fetch-Dest': 'document',
+                                'Sec-Fetch-Mode': 'navigate',
+                                'Sec-Fetch-Site': 'none',
+                                'Cache-Control': 'max-age=0'
+                            }
+                                
+                                # Longer timeout with exponential backoff
+                            timeout = 10 + (attempt * 5)  # 10s, 15s, 20s
+                                
+                            async with session.get(url, headers=headers, timeout=timeout) as response:
+                                if response.status == 200:
+                                    html = await response.text()
+                                    soup = BeautifulSoup(html, "html.parser")
+                                        
+                                        # Extract product name
+                                    estimated_name = url.split('/')[-1]  # Default fallback
+                                        
+                                    title_tag = soup.find('title')
+                                    if title_tag and title_tag.get_text().strip():
+                                        estimated_name = title_tag.get_text().strip()[:100]
+                                    else:
+                                        h1_tag = soup.find('h1')
+                                        if h1_tag and h1_tag.get_text().strip():
+                                            estimated_name = h1_tag.get_text().strip()[:100]
+                                        
+                                    print(f"     ✅ Success: {estimated_name[:50]}")
+                                    return {
+                                        'url': url,
+                                        'estimated_name': estimated_name,
+                                        'discovered_from': base_url,
+                                        'discovery_time': time.time(),
+                                        'execution_id': execution_id,
+                                        'discovery_method': 'firecrawl_discovery_manual_fetch'
+                                    }
+                                elif response.status == 403:
+                                    print(f"     🚫 Blocked (403): {url}")
+                                    return None
+                                elif response.status == 429:
+                                    print(f"     ⏳ Rate limited (429): {url}, retrying...")
+                                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                                    continue
+                                else:
+                                    print(f"     ❌ HTTP {response.status}: {url}")
+                                    return None
+                                        
+                        except asyncio.TimeoutError:
+                            print(f"     ⏰ Timeout attempt {attempt + 1}/{max_retries}: {url}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                                continue
+                            else:
+                                return None
+                        except Exception as e:
+                            error_msg = str(e) if str(e) else f"{type(e).__name__}: {repr(e)}"
+                            print(f"     ❌ Error attempt {attempt + 1}/{max_retries}: {url} - {error_msg[:100]}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(1)
+                                continue
+                            else:
+                                return None
+                        
+                    return None
+                
+                async def crawl_products_async(urls):
+                semaphore = asyncio.Semaphore(3)  # Much lower concurrency for REI
+                connector = aiohttp.TCPConnector(limit=5)  # Fewer connections
+                    
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    tasks = [fetch_product(session, url, semaphore) for url in urls[:max_products]]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                        # Filter successful results
+                    successful_products = []
+                    for result in results:
+                        if isinstance(result, dict) and result is not None:
+                            successful_products.append(result)
+                        
+                    return successful_products
+                
+                # Try manual fetch first (works for most sites)
+                print(f"   Attempting manual fetch (may fail for sites with strong anti-bot protection)...")
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                product_links = loop.run_until_complete(crawl_products_async(valuable_urls))
+                finally:
+                loop.close()
+                
+                print(f"   Manual fetch result: {len(product_links)} products")
+                
+                # If manual fetch fails, fallback to using discovered URLs as-is
+                success_rate = len(product_links) / min(len(valuable_urls), max_products) if valuable_urls else 0
+                if success_rate < 0.25:  # Less than 25% success rate
+                print(f"   Manual fetch had low success rate ({len(product_links)}/{min(len(valuable_urls), max_products)})")
+                print(f"   Using Firecrawl for content extraction instead...")
+                    
+                    # Use Firecrawl to extract content from our best URLs
+                firecrawl_extracted = []
+                for i, original_url in enumerate(valuable_urls[:max_products]):
+                    if i >= max_products:
+                        break
+                        
+                        # Clean URL by removing fragments
+                    url = original_url.split('#')[0] if '#' in original_url else original_url
+                        
+                        # Skip if URL is empty after cleaning
+                    if not url.strip():
+                        continue
+                            
+                    try:
+                        print(f"     Firecrawl extracting {i+1}/{min(len(valuable_urls), max_products)}: {url}")
+                            
+                            # Use Firecrawl's scrape_url for individual pages (bypasses anti-bot)
+                        scrape_result = firecrawl.scrape_url(
+                            url,
+                            formats=['extract'],
+                            extract={
+                                'schema': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'title': {'type': 'string'},
+                                        'description': {'type': 'string'},
+                                        'price': {'type': 'string'},
+                                        'product_name': {'type': 'string'}
+                                    }
+                                }
+                            }
+                        )
+                            
+                        if hasattr(scrape_result, 'extract') and scrape_result.extract:
+                            extracted_data = scrape_result.extract
+                            estimated_name = (
+                                extracted_data.get('product_name') or 
+                                extracted_data.get('title') or 
+                                url.split('/')[-1]
+                            )
+                                
+                            firecrawl_extracted.append({
+                                'url': url,
+                                'estimated_name': estimated_name[:100],
+                                'discovered_from': base_url,
+                                'discovery_time': time.time(),
+                                'execution_id': execution_id,
+                                'discovery_method': 'firecrawl_discovery_firecrawl_extract'
+                            })
+                                
+                            print(f"       ✅ Extracted: {estimated_name[:50]}")
+                        else:
+                                # Even if extraction fails, keep the URL
+                            firecrawl_extracted.append({
+                                'url': url,
+                                'estimated_name': url.split('/')[-1].replace('-', ' ')[:100],
+                                'discovered_from': base_url,
+                                'discovery_time': time.time(),
+                                'execution_id': execution_id,
+                                'discovery_method': 'firecrawl_discovery_url_only'
+                            })
+                            print(f"       📄 URL only: {url}")
+                                
+                    except Exception as firecrawl_extract_error:
+                        print(f"       ❌ Firecrawl extract failed: {firecrawl_extract_error}")
+                            # Still keep the URL even if Firecrawl fails
+                        firecrawl_extracted.append({
+                            'url': url,
+                            'estimated_name': url.split('/')[-1].replace('-', ' ')[:100],
+                            'discovered_from': base_url,
+                            'discovery_time': time.time(),
+                            'execution_id': execution_id,
+                            'discovery_method': 'url_only_fallback'
+                        })
+                    
+                product_links = firecrawl_extracted
+                print(f"   Firecrawl extraction result: {len(product_links)} products")
+                
+                if not product_links:
+                raise Exception("Both manual fetch and Firecrawl extraction returned no products")
+                    
+            except Exception as firecrawl_error:
+                print(f"   Hybrid approach failed: {firecrawl_error}")
+                print("   Pipeline failed - no fallback methods available.")
+                raise Exception(f"Discovery failed completely. Sitemap: {sitemap_error}. Hybrid: {firecrawl_error}")
+        
+        # Save consolidated results
+        s3_client = boto3.client('s3')
+        
+        if product_links:
+            import pandas as pd
+            from io import StringIO
+            
+            discovery_df = pd.DataFrame(product_links)
+            discovery_key = f"{environment}/{execution_id}/discovery/discovered_urls.csv"
+            
+            csv_buffer = StringIO()
+            discovery_df.to_csv(csv_buffer, index=False)
+            s3_client.put_object(
+                Bucket='flex-ai',
+                Key=discovery_key,
+                Body=csv_buffer.getvalue(),
+                ContentType='text/csv'
+            )
+            
+            print(f"Discovered {len(product_links)} URLs")
+            print(f"Saved to s3://flex-ai/{discovery_key}")
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'discovered_urls': len(product_links),
+            's3_path': f"s3://flex-ai/{discovery_key}" if product_links else None,
+            'next_stage': 'extraction_stage'
+        }
+        
+    except Exception as e:
+        print(f"Discovery failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e),
+            'execution_id': execution_id
+        }
+
+# =============================================================================
+# DYNAMIC WORKER CALCULATION
+# =============================================================================
+
+def calculate_optimal_workers(queue_size: int, stage: str) -> dict:
+    """
+    Calculate optimal worker count based on queue size and stage characteristics
+    
+    Args:
+        queue_size: Number of items to process
+        stage: Pipeline stage name
+    
+    Returns:
+        Dict with worker_count, estimated_time_minutes, and reasoning
+    """
+    
+    # Stage-specific characteristics
+    stage_configs = {
+        'extraction': {
+            'max_workers': 50,
+            'time_per_item': 10,  # seconds (Firecrawl API call)
+            'products_per_worker': 100,
+            'description': 'Firecrawl data extraction'
+        },
+        'categorization': {
+            'max_workers': 30, 
+            'time_per_item': 3,   # seconds (OpenAI API call)
+            'products_per_worker': 200,
+            'description': 'OpenAI categorization'
+        },
+        'classification': {
+            'max_workers': 30,
+            'time_per_item': 4,   # seconds (OpenAI API call) 
+            'products_per_worker': 200,
+            'description': 'HSA/FSA classification'
+        },
+        'turbopuffer': {
+            'max_workers': 20,
+            'time_per_item': 2,   # seconds (embedding + upload)
+            'products_per_worker': 300,
+            'description': 'Vector database upload'
+        }
+    }
+    
+    if stage not in stage_configs:
+        raise ValueError(f"Unknown stage: {stage}")
+    
+    config = stage_configs[stage]
+    
+    # Dynamic calculation based on queue size
+    if queue_size <= 0:
+        worker_count = 1
+        reasoning = "Minimum 1 worker for empty queue"
+    elif queue_size <= 10:
+        worker_count = min(5, queue_size)
+        reasoning = "Small job - minimal workers to avoid over-provisioning"
+    elif queue_size <= 100:
+        worker_count = min(10, max(5, queue_size // 5))
+        reasoning = "Medium job - balanced parallelization"
+    elif queue_size <= 1000:
+        worker_count = min(20, max(10, queue_size // 25))
+        reasoning = "Large job - good parallelization"
+    elif queue_size <= 10000:
+        worker_count = min(config['max_workers'], max(20, queue_size // config['products_per_worker']))
+        reasoning = "Very large job - high parallelization"
+    else:
+        worker_count = config['max_workers']
+        reasoning = "Maximum scale for 10K+ products"
+    
+    # Calculate estimated time
+    estimated_seconds = (queue_size * config['time_per_item']) / worker_count
+    estimated_minutes = max(1, int(estimated_seconds / 60))
+    
+    return {
+        'worker_count': worker_count,
+        'estimated_time_minutes': estimated_minutes,
+        'estimated_seconds': estimated_seconds,
+        'reasoning': reasoning,
+        'stage_description': config['description'],
+        'products_per_worker': queue_size // worker_count if worker_count > 0 else 0
+    }
+
+# =============================================================================
+# REUSABLE QUEUE-BASED STAGE UTILITIES
+# =============================================================================
+
+def create_queue_based_stage(
+    stage_name: str,
+    execution_id: str,
+    environment: str,
+    input_s3_prefix: str,
+    worker_function,
+    process_completed_callback=None
+):
+    """
+    Reusable utility for creating queue-based pipeline stages
+    
+    Args:
+        stage_name: Name of the stage (e.g., 'categorization')
+        execution_id: Pipeline execution ID
+        environment: dev or prod
+        input_s3_prefix: S3 prefix where input files are stored
+        worker_function: Function to spawn as workers
+        process_completed_callback: Optional callback after workers complete
+    
+    Returns:
+        Dict with stage results
+    """
+    import boto3
+    import pandas as pd
+    from io import StringIO
+    from modal import Queue
+    import time
+    
+    start_time = time.time()
+    s3_client = boto3.client('s3')
+    
+    print(f"STAGE: {stage_name.upper()} (QUEUE-BASED WITH DYNAMIC WORKERS)")
+    print(f"Execution ID: {execution_id}")
+    
+    try:
+        # List all input files from S3
+        input_prefix = f"{input_s3_prefix}/"
+        response = s3_client.list_objects_v2(
+            Bucket='flex-ai',
+            Prefix=input_prefix
+        )
+        
+        input_files = []
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                if obj['Key'].endswith('.json'):
+                    input_files.append(obj['Key'])
+        
+        queue_size = len(input_files)
+        print(f"Found {queue_size} products to process")
+        
+        if queue_size == 0:
+            print(f"No input files found in {input_prefix}")
+            return {
+                'status': 'success',
+                'processed_products': 0,
+                'message': 'No products to process'
+            }
+        
+        # Use fixed 50 workers for classification, dynamic for others
+        if stage_name == 'classification':
+            worker_count = 50
+            print(f"FIXED WORKER COUNT FOR CLASSIFICATION:")
+            print(f"   Queue Size: {queue_size}")
+            print(f"   Workers: {worker_count} (maximum parallelization)")
+            print(f"   Products per Worker: ~{queue_size // worker_count}")
+            print(f"   Stage: HSA/FSA classification with maximum speed")
+        else:
+            # Calculate optimal worker count dynamically for other stages
+            worker_config = calculate_optimal_workers(queue_size, stage_name)
+            worker_count = worker_config['worker_count']
+            
+            print(f"DYNAMIC WORKER CALCULATION:")
+            print(f"   Queue Size: {queue_size}")
+            print(f"   Optimal Workers: {worker_count}")
+            print(f"   Products per Worker: ~{worker_config['products_per_worker']}")
+            print(f"   Estimated Time: {worker_config['estimated_time_minutes']} minutes")
+            print(f"   Reasoning: {worker_config['reasoning']}")
+            print(f"   Stage: {worker_config['stage_description']}")
+        
+        # Create queue and enqueue work
+        queue_name = f"{stage_name}-{execution_id}"
+        stage_queue = Queue.from_name(queue_name, create_if_missing=True)
+        
+        print(f"Enqueuing {queue_size} products...")
+        for file_key in input_files:
+            product_id = file_key.split('/')[-1].replace('.json', '')
+            queue_helper(queue_name, "put", {
+                'product_id': product_id,
+                's3_path': file_key,
+                'stage': stage_name,
+                'execution_id': execution_id
+            })
+        
+        print(f"Starting {worker_count} {stage_name} workers...")
+        workers = []
+        for i in range(worker_count):
+            worker = worker_function.spawn(execution_id, environment)
+            workers.append(worker)
+        
+        # Wait for all workers to complete
+        print(f"Waiting for {stage_name} workers to complete...")
+        for worker in workers:
+            worker.get()
+        
+        print(f"All {stage_name} work completed")
+        
+        # Collect results
+        print(f"Collecting {stage_name} results...")
+        output_prefix = f"{environment}/{execution_id}/{stage_name}/"
+        response = s3_client.list_objects_v2(
+            Bucket='flex-ai',
+            Prefix=output_prefix
+        )
+        
+        processed_products = []
+        successful_count = 0
+        
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                if obj['Key'].endswith('.json'):
+                    try:
+                        product_data = download_product_from_s3(obj['Key'])
+                        processed_products.append(product_data)
+                        if product_data.get('status') == 'success':
+                            successful_count += 1
+                    except Exception as e:
+                        print(f"Error reading {obj['Key']}: {e}")
+        
+        # Save consolidated CSV
+        if processed_products:
+            results_df = pd.DataFrame(processed_products)
+            # Use appropriate filename for each stage
+            if stage_name == 'classification':
+                csv_filename = 'classified_products.csv'
+            elif stage_name == 'categorization':
+                csv_filename = 'categorized_products.csv'
+            elif stage_name == 'extraction':
+                csv_filename = 'extracted_products.csv'
+            else:
+                csv_filename = f'{stage_name}_products.csv'
+            
+            results_key = f"{environment}/{execution_id}/{stage_name}/{csv_filename}"
+            
+            csv_buffer = StringIO()
+            results_df.to_csv(csv_buffer, index=False)
+            s3_client.put_object(
+                Bucket='flex-ai',
+                Key=results_key,
+                Body=csv_buffer.getvalue(),
+                ContentType='text/csv'
+            )
+            
+            actual_time_minutes = int((time.time() - start_time) / 60)
+            
+            print(f"Processed {successful_count}/{len(processed_products)} products")
+            print(f"Saved summary to s3://flex-ai/{results_key}")
+            print(f"PERFORMANCE SUMMARY:")
+            print(f"   Estimated Time: {worker_config['estimated_time_minutes']} minutes")
+            print(f"   Actual Time: {actual_time_minutes} minutes")
+            print(f"   Accuracy: {'+' if actual_time_minutes <= worker_config['estimated_time_minutes'] else '-'}")
+            print(f"   Workers Used: {worker_count}")
+            print(f"   Throughput: {len(processed_products) / max(1, actual_time_minutes)} products/minute")
+        
+        # Run callback if provided
+        if process_completed_callback:
+            process_completed_callback(processed_products, execution_id, environment)
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'total_products': len(processed_products),
+            'successful_processing': successful_count,
+            's3_path': f"s3://flex-ai/{results_key}" if processed_products else None,
+            'worker_config': worker_config,
+            'actual_time_minutes': int((time.time() - start_time) / 60)
+        }
+        
+    except Exception as e:
+        print(f"{stage_name} failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e),
+            'execution_id': execution_id
+        }
+
+# =============================================================================
+# QUEUE HELPER UTILITIES
+# =============================================================================
+
+def queue_helper(queue_name: str, operation: str = "get", item: dict = None, timeout: int = 30):
+    """
+    Unified queue helper for all stages with better error handling
+    
+    Args:
+        queue_name: Name of the queue
+        operation: "put", "get", or "task_done" 
+        item: Item to put (for put operation)
+        timeout: Timeout for get operation
+    
+    Returns:
+        For get: work item dict
+        For put/task_done: True
+    """
+    import time
+    from modal import Queue
+    from modal.exception import ClientClosed
+    
+    try:
+        queue = Queue.from_name(queue_name, create_if_missing=True)
+        
+        if operation == "put":
+            if not item:
+                raise ValueError("Item required for put operation")
+                
+            queue_item = {
+                'product_id': item['product_id'],
+                'stage': item['stage'],
+                'execution_id': item['execution_id'],
+                'timestamp': time.time()
+            }
+            
+            # Add s3_path if provided (for legacy compatibility)
+            if 's3_path' in item:
+                queue_item['s3_path'] = item['s3_path']
+                
+            # Add direct data if provided (for optimization)
+            for key in ['url', 'estimated_name', 'discovered_from', 'discovery_time']:
+                if key in item:
+                    queue_item[key] = item[key]
+            queue.put(queue_item)
+            return True
+            
+        elif operation == "get":
+            try:
+                # Manual timeout implementation since Modal doesn't support it
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    try:
+                        work_item = queue.get(block=False)  # Non-blocking get
+                        if work_item is not None:  # Ensure we got a valid item
+                            return work_item
+                        else:
+                            time.sleep(0.5)  # None returned, wait and retry
+                            continue
+                    except Exception as get_error:
+                        if "empty" in str(get_error).lower() or "no items" in str(get_error).lower():
+                            time.sleep(0.5)  # Wait before retry
+                            continue
+                        else:
+                            raise get_error
+                
+                # Timeout reached
+                raise Exception("Empty")
+                
+            except ClientClosed as cc_error:
+                print(f"   Client connection closed during queue get: {cc_error}")
+                raise Exception("Empty")  # Treat as empty to allow graceful shutdown
+            except Exception as e:
+                if "empty" in str(e).lower() or "no items" in str(e).lower():
+                    raise Exception("Empty")
+                raise e
+            
+        elif operation == "task_done":
+            # Modal Queue doesn't have task_done - just return True
+            return True
+            
+        else:
+            raise ValueError(f"Unknown operation: {operation}")
+            
+    except ClientClosed as cc_error:
+        print(f"   Client connection closed during queue operation: {cc_error}")
+        if operation == "get":
+            raise Exception("Empty")  # Allow graceful shutdown
+        return True  # For put/task_done, just return success
+
+def download_product_from_s3(s3_path: str, bucket: str = "flex-ai"):
+    """Download product data from S3"""
+    import boto3
+    import json
+    
+    s3_client = boto3.client('s3')
+    response = s3_client.get_object(Bucket=bucket, Key=s3_path)
+    return json.loads(response['Body'].read().decode('utf-8'))
+
+def upload_product_to_s3(product_data: dict, s3_path: str, bucket: str = "flex-ai"):
+    """Upload product data to S3"""
+    import boto3
+    import json
+    
+    s3_client = boto3.client('s3')
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=s3_path,
+        Body=json.dumps(product_data, indent=2),
+        ContentType='application/json'
+    )
+    return True
+
+
+# =============================================================================
+# STAGE 2: EXTRACTION (Queue-Based)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("aws-s3-credentials"),
+        modal.Secret.from_name("firecrawl-api-key")
+    ],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048,    # 2GB memory for extraction processing
+    max_containers=50
+)
+def extraction_worker(execution_id: str, environment: str = "dev"):
+    """
+    Extraction worker - processes URLs from extraction queue using references
+    """
+    from firecrawl import FirecrawlApp
+    import os
+    import uuid
+    import time
+    
+    print(f"EXTRACTION WORKER STARTED - {execution_id}")
+    worker_id = str(uuid.uuid4())[:8]
+    
+    try:
+        # Initialize Firecrawl
+        firecrawl = FirecrawlApp(api_key=os.environ.get("FIRECRAWL_API_KEY"))
+        
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Product name"},
+                "description": {"type": "string", "description": "Product description"},
+                "price": {"type": "string", "description": "Product price"},
+                "brand": {"type": "string", "description": "Brand name"},
+                "features": {"type": "string", "description": "Key features"},
+                "category": {"type": "string", "description": "Product category"}
+            },
+            "required": ["name", "description"]
+        }
+        
+        queue_name = f"extraction-{execution_id}"
+        processed_count = 0
+        
+        while True:
+            try:
+                # Get work item reference from queue with timeout - now handled in queue_helper
+                work_item = queue_helper(queue_name, "get", timeout=60)
+                
+                # Safety check for None work_item
+                if work_item is None:
+                    raise Exception("Empty")
+                    
+                product_id = work_item['product_id']
+                
+                print(f"   [{worker_id}] Processing: {product_id}")
+                empty_checks = 0  # Reset counter when we get work
+                
+                # Check if already processed (checkpoint)
+                output_path = f"{environment}/{execution_id}/extraction/{product_id}.json"
+                try:
+                    # Try to download existing result - if exists, skip
+                    existing_result = download_product_from_s3(output_path)
+                    print(f"   SKIPPING {product_id} - already extracted")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                except:
+                    pass  # Not processed yet
+                
+                # Get product data directly from queue (no S3 download needed)
+                url = work_item['url']
+                discovery_data = {
+                    'product_id': product_id,
+                    'url': url,
+                    'estimated_name': work_item.get('estimated_name', ''),
+                    'discovered_from': work_item.get('discovered_from', ''),
+                    'discovery_time': work_item.get('discovery_time', time.time()),
+                    'execution_id': execution_id
+                }
+                
+                # Extract product data using Firecrawl
+                try:
+                    result = firecrawl.scrape_url(
+                        url,
+                        formats=['extract'],
+                        extract={'schema': schema}
+                    )
+                    
+                    if hasattr(result, 'extract') and result.extract:
+                        extracted_data = result.extract
+                        extracted_product = {
+                            **discovery_data,  # Keep original discovery data
+                            'name': extracted_data.get('name', 'Unknown Product'),
+                            'description': extracted_data.get('description', ''),
+                            'price': extracted_data.get('price', ''),
+                            'brand': extracted_data.get('brand', ''),
+                            'features': extracted_data.get('features', ''),
+                            'extracted_category': extracted_data.get('category', ''),
+                            'status': 'success',
+                            'extraction_worker_id': worker_id,
+                            'extraction_timestamp': time.time()
+                        }
+                        print(f"   [{worker_id}] Extracted: {extracted_data.get('name', 'Unknown')}")
+                    else:
+                        extracted_product = {
+                            **discovery_data,
+                            'name': 'Extraction Failed',
+                            'description': 'No data extracted',
+                            'price': '', 'brand': '', 'features': '', 'extracted_category': '',
+                            'status': 'failed',
+                            'extraction_worker_id': worker_id,
+                            'extraction_timestamp': time.time()
+                        }
+                        print(f"   [{worker_id}] No data extracted for {product_id}")
+                        
+                except Exception as extract_error:
+                    extracted_product = {
+                        **discovery_data,
+                        'name': 'Error',
+                        'description': f'Extraction error: {str(extract_error)}',
+                        'price': '', 'brand': '', 'features': '', 'extracted_category': '',
+                        'status': 'error',
+                        'extraction_worker_id': worker_id,
+                        'extraction_timestamp': time.time(),
+                        'error_details': str(extract_error)
+                    }
+                    print(f"   [{worker_id}] Extraction error: {extract_error}")
+                
+                # Save extracted product to S3 immediately (checkpoint)
+                upload_product_to_s3(extracted_product, output_path)
+                print(f"   [{worker_id}] CHECKPOINTED: {output_path}")
+                
+                # Queue for next stage (categorization) - only if successful
+                if extracted_product['status'] == 'success':
+                    queue_helper(f"categorization-{execution_id}", "put", {
+                        'product_id': product_id,
+                        's3_path': output_path,
+                        'stage': 'categorization',
+                        'execution_id': execution_id
+                    })
+                    print(f"   [{worker_id}] Queued {product_id} for categorization")
+                else:
+                    print(f"   [{worker_id}] Skipping {product_id} for categorization - extraction failed")
+                
+                processed_count += 1
+                queue_helper(queue_name, "task_done")
+                
+            except Exception as queue_error:
+                if "Empty" in str(queue_error):
+                    print(f"[{worker_id}] Extraction worker finished - processed {processed_count} products")
+                    break
+                elif "ClientClosed" in str(queue_error):
+                    print(f"[{worker_id}] Connection closed - extraction worker finished gracefully - processed {processed_count} products")
+                    break
+                else:
+                    print(f"   [{worker_id}] Queue error: {queue_error}")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                    
+    except Exception as e:
+        print(f"[{worker_id}] Extraction worker failed: {e}")
+        return {'status': 'failed', 'error': str(e), 'worker_id': worker_id}
+    
+    return {'status': 'success', 'processed_count': processed_count, 'worker_id': worker_id}
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048,    # 2GB memory for extraction stage processing
+    max_containers=50
+)
+def extraction_stage(
+    execution_id: str,
+    environment: str = "dev"
+):
+    """
+    Stage 2: Product Data Extraction (Queue-Based with Dynamic Workers)
+    
+    Args:
+        execution_id: From discovery stage
+        environment: dev or prod
+    
+    Returns:
+        Dict with extraction results
+    """
+    import boto3
+    import pandas as pd
+    from io import StringIO
+    import json
+    import time
+    from modal import Queue
+    
+    print(f"STAGE 2: EXTRACTION (QUEUE-BASED WITH DYNAMIC WORKERS)")
+    print(f"Execution ID: {execution_id}")
+    
+    start_time = time.time()
+    
+    try:
+        # Read discovery results CSV
+        s3_client = boto3.client('s3')
+        discovery_key = f"{environment}/{execution_id}/discovery/discovered_urls.csv"
+        
+        response = s3_client.get_object(Bucket='flex-ai', Key=discovery_key)
+        discovery_df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+        
+        queue_size = len(discovery_df)
+        print(f"Found {queue_size} URLs to extract")
+        
+        # Calculate optimal worker count dynamically
+        worker_config = calculate_optimal_workers(queue_size, 'extraction')
+        worker_count = worker_config['worker_count']
+        
+        print(f"DYNAMIC WORKER CALCULATION:")
+        print(f"   Queue Size: {queue_size}")
+        print(f"   Optimal Workers: {worker_count}")
+        print(f"   Products per Worker: ~{worker_config['products_per_worker']}")
+        print(f"   Estimated Time: {worker_config['estimated_time_minutes']} minutes")
+        print(f"   Reasoning: {worker_config['reasoning']}")
+        print(f"   Stage: {worker_config['stage_description']}")
+        
+        # Single-threaded bulk queueing (avoid contention issues)
+        print("Queueing products for extraction using bulk operations...")
+        
+        # Build all queue items at once
+        all_queue_items = []
+        for i, (_, row) in enumerate(discovery_df.iterrows()):
+            product_id = f"product_{i:06d}"
+            
+            queue_item = {
+                'product_id': product_id,
+                'url': row['url'],
+                'estimated_name': row.get('estimated_name', ''),
+                'discovered_from': row.get('discovered_from', ''),
+                'discovery_time': row.get('discovery_time', time.time()),
+                'stage': 'extraction',
+                'execution_id': execution_id,
+                'timestamp': time.time()
+            }
+            all_queue_items.append(queue_item)
+        
+        # Queue first batch immediately to start workers, then continue
+        from modal import Queue
+        extraction_queue = Queue.from_name(f"extraction-{execution_id}", create_if_missing=True)
+        
+        # Queue first 1000 items quickly to get workers started
+        initial_batch_size = min(1000, len(all_queue_items))
+        print(f"Queueing first {initial_batch_size} products to start workers...")
+        
+        for i in range(initial_batch_size):
+            extraction_queue.put(all_queue_items[i])
+        
+        print(f"Initial batch queued - starting {worker_count} extraction workers...")
+        
+        # Start extraction workers immediately
+        workers = []
+        
+        for i in range(worker_count):
+            worker = extraction_worker.spawn(execution_id, environment)
+            workers.append(worker)
+        
+        print(f"Workers started! Now queueing remaining {len(all_queue_items) - initial_batch_size} products in background...")
+        
+        # Queue remaining items in smaller batches to avoid Modal queue limits
+        if len(all_queue_items) > initial_batch_size:
+            remaining_items = all_queue_items[initial_batch_size:]
+            batch_size = 500  # Queue 500 at a time to stay under limits
+            
+            for batch_start in range(0, len(remaining_items), batch_size):
+                batch_end = min(batch_start + batch_size, len(remaining_items))
+                batch = remaining_items[batch_start:batch_end]
+                
+                # Queue this batch
+                for item in batch:
+                    extraction_queue.put(item)
+                
+                total_queued = initial_batch_size + batch_end
+                print(f"   Background queuing: {total_queued}/{len(all_queue_items)} products...")
+                
+                # Small delay between batches to avoid overwhelming the queue
+                import time
+                time.sleep(0.1)
+        
+        # Start next stages IMMEDIATELY with balanced parallelism
+        print("Starting 30 categorization workers immediately to process results as they come in...")
+        categorization_workers = []
+        for i in range(30):  # Balanced worker count
+            cat_worker = categorization_worker.spawn(execution_id, environment)
+            categorization_workers.append(cat_worker)
+        
+        print("Starting 30 classification workers immediately for full 3-stage overlap...")
+        classification_workers = []
+        for i in range(30):  # Balanced worker count
+            class_worker = classification_worker.spawn(execution_id, environment)
+            classification_workers.append(class_worker)
+            
+        print("All 3 stages now running in parallel from the start!")
+        print("Pipeline flow: Products → Extract → Categorize → Classify (all simultaneous)")
+        
+        print("Continuing background queueing while all stages process...")
+        
+        print("All 3 stages now running in parallel: extraction → categorization → classification")
+        
+        # Monitor progress and wait for extraction workers to complete
+        print("Waiting for extraction workers to complete...")
+        
+        # Wait for all extraction worker handles to complete
+        for worker in workers:
+            worker.get()  # This blocks until the worker completes
+        
+        print("All extraction workers completed! Signaling categorization workers to finish...")
+        
+        # Signal categorization workers that extraction is complete
+        categorization_queue_name = f"categorization-{execution_id}"
+        for i in range(30):  # Send COMPLETE signal to all 30 categorization workers
+            queue_helper(categorization_queue_name, "put", {
+                'product_id': 'EXTRACTION_COMPLETE',
+                'stage': 'categorization', 
+                'execution_id': execution_id,
+                'signal': 'EXTRACTION_COMPLETE'
+            })
+            
+        # Wait for categorization workers to complete
+        print("Waiting for categorization workers to complete...")
+        for worker in categorization_workers:
+            worker.get()
+        
+        print("All categorization workers completed! Signaling classification workers to finish...")
+        
+        # Signal classification workers that categorization is complete
+        classification_queue_name = f"classification-{execution_id}"
+        for i in range(30):  # Send COMPLETE signal to all 30 classification workers
+            queue_helper(classification_queue_name, "put", {
+                'product_id': 'CATEGORIZATION_COMPLETE',
+                'stage': 'classification',
+                'execution_id': execution_id,
+                'signal': 'CATEGORIZATION_COMPLETE'
+            })
+        
+        # Wait for classification workers to complete
+        print("Waiting for classification workers to complete...")
+        for worker in classification_workers:
+            worker.get()
+            
+        print("All workers completed! Creating consolidated CSV files...")
+        
+        # Create consolidated CSV files using the dedicated function
+        stages_to_consolidate = ['extraction', 'categorization', 'classification']
+        
+        for stage_name in stages_to_consolidate:
+            print(f"Consolidating {stage_name} JSON files to CSV...")
+            try:
+                result = consolidate_json_to_csv.remote(execution_id, stage_name, environment)
+                if result['status'] == 'success':
+                    print(f"✅ {stage_name}: {result['products_processed']} products")
+                else:
+                    print(f"❌ {stage_name}: {result['message']}")
+            except Exception as e:
+                print(f"❌ {stage_name} consolidation failed: {e}")
+        
+        print("All overlapping pipeline stages completed!")
+        
+        # Collect results and create summary CSV
+        print("Collecting extraction results...")
+        
+        extraction_prefix = f"{environment}/{execution_id}/extraction/"
+        response = s3_client.list_objects_v2(
+            Bucket='flex-ai',
+            Prefix=extraction_prefix
+        )
+        
+        extracted_products = []
+        successful_extractions = 0
+        
+        if 'Contents' in response:
+            print(f"Found {len(response['Contents'])} extraction results")
+            for obj in response['Contents']:
+                try:
+                    product_data = download_product_from_s3(obj['Key'])
+                    extracted_products.append(product_data)
+                    if product_data.get('status') == 'success':
+                        successful_extractions += 1
+                except Exception as e:
+                    print(f"Error reading {obj['Key']}: {e}")
+        
+        # Save consolidated CSV
+        if extracted_products:
+            extraction_df = pd.DataFrame(extracted_products)  
+            extraction_key = f"{environment}/{execution_id}/extraction/extracted_products.csv"
+            
+            csv_buffer = StringIO()
+            extraction_df.to_csv(csv_buffer, index=False)
+            s3_client.put_object(
+                Bucket='flex-ai',
+                Key=extraction_key,
+                Body=csv_buffer.getvalue(),
+                ContentType='text/csv'
+            )
+            
+            actual_time_minutes = int((time.time() - start_time) / 60)
+            
+            print(f"Extracted {successful_extractions}/{len(extracted_products)} products")
+            print(f"Saved summary to s3://flex-ai/{extraction_key}")
+            print(f"PERFORMANCE SUMMARY:")
+            print(f"   Estimated Time: {worker_config['estimated_time_minutes']} minutes")
+            print(f"   Actual Time: {actual_time_minutes} minutes")
+            print(f"   Accuracy: {'+' if actual_time_minutes <= worker_config['estimated_time_minutes'] else '-'}")
+            print(f"   Workers Used: {worker_count}")
+            print(f"   Throughput: {len(extracted_products) / max(1, actual_time_minutes)} products/minute")
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'total_products': len(extracted_products),
+            'successful_extractions': successful_extractions,
+            's3_path': f"s3://flex-ai/{extraction_key}" if extracted_products else None,
+            'next_stage': 'categorization_stage',
+            'worker_config': worker_config,
+            'actual_time_minutes': int((time.time() - start_time) / 60) if 'start_time' in locals() else None
+        }
+        
+    except Exception as e:
+        print(f"Extraction failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e),
+            'execution_id': execution_id
+        }
+
+# =============================================================================
+# STAGE 3: CATEGORIZATION (Queue-Based)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("aws-s3-credentials"),
+        modal.Secret.from_name("openai-api-key")
+    ],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=3072,    # 3GB memory for AI processing tasks
+    max_containers=50
+)
+def categorization_worker(execution_id: str, environment: str = "dev"):
+    """
+    Categorization worker - processes products from categorization queue using references
+    """
+    import openai
+    import os
+    import uuid
+    import time
+    import json
+    
+    print(f"CATEGORIZATION WORKER STARTED - {execution_id}")
+    worker_id = str(uuid.uuid4())[:8]
+    
+    try:
+        # Load categories and categorization prompt template
+        with open('/prompts/flex_product_categories.json', 'r') as f:
+            categories_data = json.load(f)
+            categories = {cat['name']: cat for cat in categories_data['categories']}
+            
+        with open('/prompts/categorization_prompt.txt', 'r') as f:
+            categorization_prompt_template = f.read()
+            
+        print(f"   [{worker_id}] Loaded {len(categories)} categories and prompt template")
+        
+        # Initialize OpenAI
+        client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        
+        queue_name = f"categorization-{execution_id}"
+        processed_count = 0
+        empty_checks = 0
+        
+        while True:
+            try:
+                # Get work item reference from queue with timeout - now handled in queue_helper
+                work_item = queue_helper(queue_name, "get", timeout=60)
+                
+                # Safety check for None work_item
+                if work_item is None:
+                    raise Exception("Empty")
+                    
+                product_id = work_item['product_id']
+                
+                # Check for completion signal
+                if product_id == 'EXTRACTION_COMPLETE':
+                    print(f"[{worker_id}] Received EXTRACTION_COMPLETE signal - categorization worker finished - processed {processed_count} products")
+                    break
+                
+                print(f"   [{worker_id}] Processing: {product_id}")
+                empty_checks = 0  # Reset counter when we get work
+                
+                # Check if already processed (checkpoint)
+                output_path = f"{environment}/{execution_id}/categorization/{product_id}.json"
+                try:
+                    existing_result = download_product_from_s3(output_path)
+                    print(f"   SKIPPING {product_id} - already categorized")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                except:
+                    pass  # Not processed yet
+                
+                # Download product data from S3
+                extraction_data = download_product_from_s3(work_item['s3_path'])
+                
+                # Create categorization prompt using loaded template and categories
+                categories_text = ""
+                category_names = []
+                for cat_name, cat_data in categories.items():
+                    categories_text += f"\n- {cat_name}: {cat_data['description']}\n  Keywords: {', '.join(cat_data['keywords'])}\n"
+                    category_names.append(cat_name)
+                
+                # Create a list of valid category names for the prompt
+                valid_categories = '", "'.join(category_names)
+                
+                # Use the loaded prompt template and substitute variables
+                prompt = categorization_prompt_template.replace(
+                    "{{PRODUCT_NAME}}", str(extraction_data.get('name', ''))
+                ).replace(
+                    "{{PRODUCT_DESCRIPTION}}", str(extraction_data.get('description', ''))
+                ).replace(
+                    "{{PRODUCT_BRAND}}", str(extraction_data.get('brand', ''))
+                ).replace(
+                    "{{PRODUCT_FEATURES}}", str(extraction_data.get('features', ''))
+                ).replace(
+                    "{{CATEGORIES_LIST}}", categories_text
+                ).replace(
+                    "{{VALID_CATEGORY_NAMES}}", valid_categories
+                )
+                
+                # Call OpenAI for categorization
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are a product categorization expert for HSA/FSA eligibility."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0,
+                        max_tokens=5000
+                    )
+                    
+                    response_content = response.choices[0].message.content
+                    if response_content.startswith('```json'):
+                        response_content = response_content.replace('```json', '').replace('```', '').strip()
+                    
+                    result = json.loads(response_content)
+                    predicted_category = result.get('primary_category', 'unknown')
+                    
+                    # Validate that the category is in our valid list
+                    if predicted_category not in categories:
+                        print(f"   [{worker_id}] INVALID CATEGORY: '{predicted_category}' not in valid categories")
+                        
+                        # Create error record for S3 error folder
+                        error_record = {
+                            'execution_id': execution_id,
+                            'stage': 'categorization',
+                            'error_type': 'invalid_category',
+                            'product_name': extraction_data.get('name', ''),
+                            'product_url': extraction_data.get('url', ''),
+                            'product_description': extraction_data.get('description', '')[:200],
+                            'invalid_category_attempted': predicted_category,
+                            'ai_raw_response': response_content,
+                            'timestamp': time.time(),
+                            'worker_id': worker_id,
+                            'error_message': f'AI returned invalid category: {predicted_category}',
+                            'action_needed': 'Either add category to flex_product_categories.json or improve prompt'
+                        }
+                        
+                        # Save error to S3 error folder
+                        import boto3
+                        s3_client = boto3.client('s3')
+                        error_key = f"{environment}/{execution_id}/error/categorization_invalid_category_{product_id}.json"
+                        s3_client.put_object(
+                            Bucket='flex-ai',
+                            Key=error_key,
+                            Body=json.dumps(error_record, indent=2),
+                            ContentType='application/json'
+                        )
+                        print(f"   [{worker_id}] Error saved to s3://flex-ai/{error_key}")
+                        
+                        # Save error product
+                        categorized_product = {
+                            **extraction_data,
+                            'primary_category': 'INVALID_CATEGORY_ERROR',
+                            'invalid_category_attempted': predicted_category,
+                            'category_confidence': 0.0,
+                            'categorization_reasoning': f'AI returned invalid category: {predicted_category}',
+                            'hsa_fsa_likelihood': 'unknown',
+                            'status': 'invalid_category_error',
+                            'categorization_worker_id': worker_id,
+                            'categorization_timestamp': time.time(),
+                            'ai_raw_response': response_content
+                        }
+                    else:
+                        # Valid category - process normally
+                        categorized_product = {
+                            **extraction_data,
+                            'primary_category': predicted_category,
+                            'category_confidence': result.get('confidence', 0.0),
+                            'categorization_reasoning': result.get('reasoning', ''),
+                            'hsa_fsa_likelihood': result.get('hsa_fsa_likelihood', 'unknown'),
+                            'status': 'success',
+                            'categorization_worker_id': worker_id,
+                            'categorization_timestamp': time.time()
+                        }
+                        print(f"   [{worker_id}] {extraction_data.get('name', product_id)} -> {predicted_category}")
+                    
+                except Exception as openai_error:
+                    print(f"   [{worker_id}] OpenAI error: {openai_error}")
+                    categorized_product = {
+                        **extraction_data,
+                        'primary_category': 'error',
+                        'category_confidence': 0.0,
+                        'categorization_reasoning': f'OpenAI error: {str(openai_error)}',
+                        'hsa_fsa_likelihood': 'unknown',
+                        'status': 'error',
+                        'categorization_worker_id': worker_id,
+                        'categorization_timestamp': time.time(),
+                        'error_details': str(openai_error)
+                    }
+                
+                # Save categorized product to S3 immediately (checkpoint)
+                upload_product_to_s3(categorized_product, output_path)
+                print(f"   [{worker_id}] CHECKPOINTED: {output_path}")
+                
+                # Queue for next stage (classification) - only if successful
+                if categorized_product.get('status') == 'success':
+                    queue_helper(f"classification-{execution_id}", "put", {
+                        'product_id': product_id,
+                        's3_path': output_path,
+                        'stage': 'classification',
+                        'execution_id': execution_id
+                    })
+                    print(f"   [{worker_id}] Queued {product_id} for classification")
+                else:
+                    print(f"   [{worker_id}] Skipping {product_id} for classification - categorization failed")
+                
+                processed_count += 1
+                queue_helper(queue_name, "task_done")
+                
+            except Exception as queue_error:
+                if "Empty" in str(queue_error):
+                    print(f"   [{worker_id}] Queue empty, waiting for more work...")
+                    import time
+                    time.sleep(2)  # Shorter wait
+                    empty_checks += 1
+                    if empty_checks >= 5:  # 10 seconds of empty queue = done
+                        print(f"[{worker_id}] Queue empty for 10+ seconds, assuming work complete - processed {processed_count} products")
+                        break
+                    continue
+                elif "ClientClosed" in str(queue_error):
+                    print(f"[{worker_id}] Connection closed - categorization worker finished gracefully - processed {processed_count} products")
+                    break
+                else:
+                    print(f"   [{worker_id}] Queue error: {queue_error}")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                    
+    except Exception as e:
+        print(f"[{worker_id}] Categorization worker failed: {e}")
+        return {'status': 'failed', 'error': str(e), 'worker_id': worker_id}
+    
+    return {'status': 'success', 'processed_count': processed_count, 'worker_id': worker_id}
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048,    # 2GB memory for categorization stage processing
+    max_containers=50
+)
+def categorization_stage(
+    execution_id: str,
+    environment: str = "dev"
+):
+    """
+    Stage 3: Product Categorization (Queue-Based with Dynamic Workers)
+    
+    Args:
+        execution_id: From previous stage
+        environment: dev or prod
+    
+    Returns:
+        Dict with categorization results
+    """
+    print(f"STAGE 3: CATEGORIZATION (QUEUE-BASED WITH DYNAMIC WORKERS)")
+    
+    # Use the reusable queue-based stage utility
+    return create_queue_based_stage(
+        stage_name='categorization',
+        execution_id=execution_id,
+        environment=environment,
+        input_s3_prefix=f"{environment}/{execution_id}/extraction",
+        worker_function=categorization_worker
+    )
+
+# =============================================================================
+# STAGE 4: CLASSIFICATION
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("aws-s3-credentials"),
+        modal.Secret.from_name("openai-api-key")
+    ],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=3072,    # 3GB memory for AI processing tasks
+    max_containers=50
+)
+def classification_worker(execution_id: str, environment: str = "dev"):
+    """
+    Classification worker - processes products from classification queue using references
+    """
+    import openai
+    import os
+    import uuid
+    import time
+    import json
+    
+    print(f"CLASSIFICATION WORKER STARTED - {execution_id}")
+    worker_id = str(uuid.uuid4())[:8]
+    
+    try:
+        # Load eligibility prompt template and category-specific guides
+        with open('/prompts/feligibity.txt', 'r') as f:
+            eligibility_prompt_template = f.read()
+        
+        with open('/prompts/flex_guide_mapped_to_categories.json', 'r') as f:
+            guides_data = json.load(f)
+            # Create lookup dict by category name for easy access
+            category_guides = {guide['category']: guide['items'] for guide in guides_data['guide']}
+            
+        print(f"   [{worker_id}] Loaded eligibility prompt template and category-specific guides for {len(category_guides)} categories")
+        
+        # Initialize OpenAI
+        client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        
+        queue_name = f"classification-{execution_id}"
+        processed_count = 0
+        
+        while True:
+            try:
+                # Get work item reference from queue with timeout - now handled in queue_helper
+                work_item = queue_helper(queue_name, "get", timeout=60)
+                
+                # Safety check for None work_item
+                if work_item is None:
+                    raise Exception("Empty")
+                    
+                product_id = work_item['product_id']
+                
+                # Check for completion signal
+                if product_id == 'CATEGORIZATION_COMPLETE':
+                    print(f"[{worker_id}] Received CATEGORIZATION_COMPLETE signal - classification worker finished - processed {processed_count} products")
+                    break
+                
+                print(f"   [{worker_id}] Processing: {product_id}")
+                empty_checks = 0  # Reset counter when we get work
+                
+                # Check if already processed (checkpoint)
+                output_path = f"{environment}/{execution_id}/classification/{product_id}.json"
+                try:
+                    existing_result = download_product_from_s3(output_path)
+                    print(f"   SKIPPING {product_id} - already classified")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                except:
+                    pass  # Not processed yet
+                
+                # Download product data from S3
+                categorization_data = download_product_from_s3(work_item['s3_path'])
+                
+                # Skip products with categorization errors
+                if categorization_data.get('status') == 'invalid_category_error':
+                    print(f"   [{worker_id}] SKIPPING classification for {categorization_data.get('name', product_id)} - invalid category error in previous stage")
+                    # Pass through the error product unchanged
+                    classified_product = {
+                        **categorization_data,
+                        'eligibility_status': 'SKIPPED_DUE_TO_CATEGORIZATION_ERROR',
+                        'eligibility_rationale': f'Classification skipped because categorization failed with invalid category: {categorization_data.get("invalid_category_attempted", "unknown")}',
+                        'additional_considerations': 'Fix categorization error first',
+                        'lmn_qualification_probability': 'N/A',
+                        'classification_confidence': 0,
+                        'classification_worker_id': worker_id,
+                        'classification_timestamp': time.time()
+                    }
+                else:
+                    try:
+                        # Get the category from categorization step
+                        category = categorization_data.get('primary_category', 'unknown')
+                        
+                        # Get category-specific guide items
+                        category_guide_items = category_guides.get(category, [])
+                        
+                        if category_guide_items:
+                            # Format the category-specific guide
+                            category_specific_guide = f"Category: {category}\n\nHSA/FSA Guidelines for {category}:\n"
+                            for item in category_guide_items:
+                                category_specific_guide += f"\n{item['name']}\n{item['eligibility']}\n{item['description']}\n"
+                            print(f"   [{worker_id}] Using {len(category_guide_items)} guide items for category: {category}")
+                        else:
+                            category_specific_guide = f"Category: {category}\n\nNo specific guidelines found for this category. Use general HSA/FSA rules."
+                            print(f"   [{worker_id}] No specific guide found for category: {category}")
+                        
+                        # Use the loaded prompt template and substitute variables
+                        prompt = eligibility_prompt_template.replace(
+                            "{{Flex Product Guide}}", category_specific_guide
+                        ).replace(
+                            "{{PRODUCT_NAME}}", str(categorization_data.get('name', ''))
+                        ).replace(
+                            "{{PRODUCT_DESCRIPTION}}", str(categorization_data.get('description', ''))
+                        )
+                        
+                        response = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "user", "content": prompt}
+                            ],
+                            temperature=0,
+                            max_tokens=5000
+                        )
+                        
+                        response_content = response.choices[0].message.content
+                        
+                        # Extract JSON from response (it should be in ```json blocks)
+                        if '```json' in response_content:
+                            json_start = response_content.find('```json') + 7
+                            json_end = response_content.find('```', json_start)
+                            json_content = response_content[json_start:json_end].strip()
+                        else:
+                            # Fallback if no markdown blocks
+                            json_content = response_content.strip()
+                        
+                        result = json.loads(json_content)
+                        
+                        classified_product = {
+                            **categorization_data,
+                            'eligibility_status': result.get('eligibilityStatus', 'unknown'),
+                            'eligibility_rationale': result.get('explanation', ''),
+                            'additional_considerations': result.get('additionalConsiderations', ''),
+                            'lmn_qualification_probability': result.get('lmnQualificationProbability', 'N/A'),
+                            'classification_confidence': result.get('confidencePercentage', 0),
+                            'status': 'success',
+                            'classification_worker_id': worker_id,
+                            'classification_timestamp': time.time()
+                        }
+                        
+                        print(f"   [{worker_id}] {categorization_data.get('name', product_id)} -> {result.get('eligibilityStatus', 'unknown')}")
+                        
+                    except Exception as classification_error:
+                        print(f"   [{worker_id}] Classification error: {classification_error}")
+                        classified_product = {
+                            **categorization_data,
+                            'eligibility_status': 'error',
+                            'eligibility_rationale': f'Error: {str(classification_error)}',
+                            'additional_considerations': '',
+                            'lmn_qualification_probability': 'N/A',
+                            'classification_confidence': 0,
+                            'status': 'error',
+                            'classification_worker_id': worker_id,
+                            'classification_timestamp': time.time()
+                        }
+                
+                # Save result to S3
+                upload_product_to_s3(classified_product, output_path)
+                
+                processed_count += 1
+                print(f"   [{worker_id}] Saved to S3: {output_path}")
+                queue_helper(queue_name, "task_done")
+                
+            except Exception as queue_error:
+                if "Empty" in str(queue_error):
+                    print(f"   [{worker_id}] Queue empty, waiting for more work or completion signal...")
+                    import time
+                    time.sleep(5)  # Wait before retrying
+                    continue
+                elif "ClientClosed" in str(queue_error):
+                    print(f"[{worker_id}] Connection closed - classification worker finished gracefully - processed {processed_count} products")
+                    break
+                else:
+                    print(f"   [{worker_id}] Queue error: {queue_error}")
+                    queue_helper(queue_name, "task_done")
+                    continue
+                    
+    except Exception as worker_error:
+        print(f"   [{worker_id}] Worker error: {worker_error}")
+        raise
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("aws-s3-credentials"),
+        modal.Secret.from_name("openai-api-key")
+    ],
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048,    # 2GB memory for classification stage processing
+    max_containers=50
+)
+def classification_stage(
+    execution_id: str,
+    environment: str = "dev"
+):
+    """
+    Stage 4: HSA/FSA Eligibility Classification (Queue-based with dynamic workers)
+    
+    Args:
+        execution_id: From previous stage
+        environment: dev or prod
+    
+    Returns:
+        Dict with classification results
+    """
+    return create_queue_based_stage(
+        stage_name='classification',
+        execution_id=execution_id,
+        environment=environment,
+        input_s3_prefix=f"{environment}/{execution_id}/categorization",
+        worker_function=classification_worker
+    )
+
+# =============================================================================
+# STAGE 5: TURBOPUFFER
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=secrets,
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048,    # 2GB memory for turbopuffer stage processing
+    max_containers=2
+)
+def turbopuffer_stage(
+    execution_id: str,
+    environment: str = "dev"
+):
+    """
+    Stage 5: Turbopuffer Vector Database Upload
+    
+    Args:
+        execution_id: From previous stage
+        environment: dev or prod
+    
+    Returns:
+        Dict with upload results
+    """
+    import boto3
+    import pandas as pd
+    from io import StringIO
+    import turbopuffer as tpuf
+    import openai
+    import os
+    
+    print(f"STAGE 5: TURBOPUFFER UPLOAD")
+    print(f"Execution ID: {execution_id}")
+    
+    try:
+        # Read classification results
+        s3_client = boto3.client('s3')
+        classification_key = f"{environment}/{execution_id}/classification/classified_products.csv"
+        
+        response = s3_client.get_object(Bucket='flex-ai', Key=classification_key)
+        classification_df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+        
+        print(f"Uploading {len(classification_df)} products to Turbopuffer")
+        
+        # Initialize Turbopuffer and OpenAI
+        tpuf_client = tpuf.Turbopuffer(
+            region="gcp-us-central1",
+            api_key=os.environ.get("TURBOPUFFER_API_KEY")
+        )
+        openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        
+        namespace = f"products-{environment}-{execution_id}"
+        uploaded_products = []
+        
+        for i, (_, product) in enumerate(classification_df.iterrows()):
+            # Skip products with errors from previous stages
+            if product.get('status') == 'invalid_category_error' or product.get('eligibility_status') == 'SKIPPED_DUE_TO_CATEGORIZATION_ERROR':
+                print(f"   SKIPPING Turbopuffer upload for {product['name']} - has errors from previous stages")
+                # Pass through the error product unchanged
+                uploaded_products.append({
+                    **product.to_dict(),
+                    'turbopuffer_id': '',
+                    'namespace': namespace,
+                    'upload_success': False,
+                    'upload_error': 'Skipped due to categorization/classification errors'
+                })
+                continue
+                
+            try:
+                print(f"   Uploading {i+1}/{len(classification_df)}: {product['name']}")
+                
+                # Generate embedding
+                embedding_text = f"{product['name']} {product['description']} {product.get('features', '')} {product.get('brand', '')}"
+                
+                embedding_response = openai_client.embeddings.create(
+                    model="text-embedding-ada-002",
+                    input=embedding_text[:8000]
+                )
+                
+                embedding_vector = embedding_response.data[0].embedding
+                
+                # Upload to Turbopuffer
+                row_data = {
+                    'id': f"{execution_id}_{i+1}",
+                    'vector': embedding_vector,
+                    'name': str(product['name'])[:100],
+                    'url': str(product['url']),
+                    'category': str(product.get('primary_category', 'unknown'))[:50],
+                    'eligibility': str(product.get('eligibility_status', 'unknown'))[:20]
+                }
+                
+                result = tpuf_client.namespaces().write(
+                    namespace=namespace,
+                    distance_metric='cosine_distance',
+                    upsert_rows=[row_data]
+                )
+                
+                uploaded_product = {
+                    **product.to_dict(),
+                    'turbopuffer_id': f"{execution_id}_{i+1}",
+                    'namespace': namespace,
+                    'upload_success': True
+                }
+                
+                uploaded_products.append(uploaded_product)
+                print(f"   Uploaded: {product['name']}")
+                
+            except Exception as e:
+                print(f"   Upload error: {e}")
+                uploaded_products.append({
+                    **product.to_dict(),
+                    'turbopuffer_id': '',
+                    'namespace': namespace,
+                    'upload_success': False,
+                    'upload_error': str(e)
+                })
+        
+        # Save results
+        final_df = pd.DataFrame(uploaded_products)
+        final_key = f"{environment}/{execution_id}/turbopuffer/uploaded_products.csv"
+        
+        csv_buffer = StringIO()
+        final_df.to_csv(csv_buffer, index=False)
+        s3_client.put_object(
+            Bucket='flex-ai',
+            Key=final_key,
+            Body=csv_buffer.getvalue(),
+            ContentType='text/csv'
+        )
+        
+        successful_uploads = len([p for p in uploaded_products if p.get('upload_success', False)])
+        print(f"Uploaded {successful_uploads}/{len(uploaded_products)} products")
+        print(f"Namespace: {namespace}")
+        print(f"Saved to s3://flex-ai/{final_key}")
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'total_products': len(uploaded_products),
+            'successful_uploads': successful_uploads,
+            'turbopuffer_namespace': namespace,
+            's3_path': f"s3://flex-ai/{final_key}"
+        }
+        
+    except Exception as e:
+        print(f"Turbopuffer upload failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e),
+            'execution_id': execution_id
+        }
+
+# =============================================================================
+# CSV-ONLY CLASSIFICATION PIPELINE (For existing product data)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours
+    memory=2048,    # 2GB memory for CSV processing
+    max_containers=20
+)
+def csv_processing_worker(execution_id: str, environment: str, csv_file_path: str):
+    """
+    CSV processing worker - converts CSV rows to extraction format and queues for categorization
+    This simulates the extraction stage for CSV-only pipeline
+    """
+    import uuid
+    import pandas as pd
+    import boto3
+    import json
+    import time
+    from io import StringIO
+    
+    print(f"CSV PROCESSING WORKER STARTED - {execution_id}")
+    worker_id = str(uuid.uuid4())[:8]
+    
+    # Read CSV file once for this worker
+    s3_client = boto3.client('s3')
+    if csv_file_path.startswith('s3://'):
+        bucket = csv_file_path.replace('s3://', '').split('/')[0]
+        key = '/'.join(csv_file_path.replace('s3://', '').split('/')[1:])
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+    else:
+        df = pd.read_csv(csv_file_path)
+    
+    print(f"   [{worker_id}] Loaded CSV with {len(df)} rows")
+    
+    queue_name = f"csv-processing-{execution_id}"
+    processed_count = 0
+    empty_checks = 0
+    
+    while True:
+        try:
+            # Get work item from CSV processing queue
+            work_item = queue_helper(queue_name, "get")
+            if not work_item:
+                raise Exception("Empty")
+                
+            csv_row_index = work_item['csv_row_index']
+            product_id = work_item['product_id']
+            
+            print(f"   [{worker_id}] Processing CSV row {csv_row_index}: {product_id}")
+            empty_checks = 0  # Reset counter when we get work
+            
+            # Get row data from DataFrame
+            row = df.iloc[csv_row_index]
+            
+            # Create fake extraction data from CSV row (same as before)
+            fake_extracted_product = {
+                'product_id': product_id,
+                'name': str(row.get('name', 'Unknown Product')), 
+                'description': str(row.get('description', '')),
+                'price': str(row.get('price', '')),
+                'brand': extract_brand_from_name(str(row.get('name', ''))),
+                'features': '',  # Not in CSV
+                'extracted_category': '',  # Will be determined by categorization
+                'url': f"https://dermstore.com/products/{str(row.get('name', '')).lower().replace(' ', '-')[:50]}",
+                'status': 'success',
+                'source': 'csv_input',
+                'original_hsa_fsa_eligibility': str(row.get('hsa_fsa_eligibility', 'unknown')),
+                'execution_id': execution_id,
+                'csv_row_index': csv_row_index
+            }
+            
+            # Save to S3 as extraction result
+            extraction_path = f"{environment}/{execution_id}/extraction/{product_id}.json"
+            s3_client.put_object(
+                Bucket='flex-ai',
+                Key=extraction_path, 
+                Body=json.dumps(fake_extracted_product, indent=2),
+                ContentType='application/json'
+            )
+            
+            # Queue for categorization (cascading like main pipeline)
+            queue_helper(f"categorization-{execution_id}", "put", {
+                'product_id': product_id,
+                's3_path': extraction_path,
+                'stage': 'categorization',
+                'execution_id': execution_id
+            })
+            
+            print(f"   [{worker_id}] Processed and queued {product_id} for categorization")
+            processed_count += 1
+            queue_helper(queue_name, "task_done")
+            
+        except Exception as queue_error:
+            if "Empty" in str(queue_error):
+                print(f"   [{worker_id}] CSV processing queue empty, waiting for more work...")
+                time.sleep(2)  # Shorter wait
+                empty_checks += 1
+                if empty_checks >= 5:  # 10 seconds of empty queue = done
+                    print(f"[{worker_id}] Queue empty for 10+ seconds, assuming work complete - processed {processed_count} CSV rows")
+                    break
+                continue
+            elif "ClientClosed" in str(queue_error):
+                print(f"[{worker_id}] Connection closed - CSV processing worker finished gracefully - processed {processed_count} CSV rows")
+                break
+            else:
+                print(f"   [{worker_id}] Queue error: {queue_error}")
+                queue_helper(queue_name, "task_done")
+                continue
+    
+    print(f"[{worker_id}] CSV processing worker completed - processed {processed_count} CSV rows")
+    return {"processed_count": processed_count, "worker_id": worker_id}
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours
+    memory=4096,  # 4GB for large CSV processing
+    cpu=2
+)
+def reclassify_csv_simple(
+    csv_file_path: str,
+    limit: int = None,
+    skip_rows: int = 0,
+    environment: str = "dev",
+    execution_id: str = None
+):
+    """
+    Simple CSV reclassification that mimics main pipeline exactly
+    
+    Args:
+        csv_file_path: Path to CSV file
+        limit: Number of products to process (None for all)
+        skip_rows: Number of rows to skip (for continuing from previous run)
+        environment: dev or prod
+        execution_id: Unique execution ID
+    """
+    import uuid
+    import pandas as pd
+    import boto3
+    import json
+    import time
+    from io import StringIO
+    
+    if not execution_id:
+        execution_id = str(uuid.uuid4())[:8]
+    
+    print(f"SIMPLE CSV RECLASSIFICATION PIPELINE")
+    print(f"Execution ID: {execution_id}")
+    print(f"CSV File: {csv_file_path}")
+    print(f"Skip rows: {skip_rows}")
+    print(f"Limit: {limit}")
+    print(f"Environment: {environment}")
+    print("=" * 80)
+    
+    # Read CSV
+    s3_client = boto3.client('s3')
+    if csv_file_path.startswith('s3://'):
+        bucket = csv_file_path.replace('s3://', '').split('/')[0]
+        key = '/'.join(csv_file_path.replace('s3://', '').split('/')[1:])
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+    else:
+        df = pd.read_csv(csv_file_path)
+    
+    # Apply skip and limit
+    if skip_rows > 0:
+        df = df.iloc[skip_rows:]
+        print(f"Skipped first {skip_rows} rows")
+    
+    if limit:
+        df = df.head(limit)
+        print(f"Limited to {limit} products")
+        
+    print(f"Processing {len(df)} products")
+    
+    # STEP 1: Start all workers immediately and create extraction data in parallel
+    print(f"\nSTEP 1: Starting all workers and creating extraction data in parallel...")
+    
+    # Use fixed worker counts for maximum performance 
+    categorization_worker_count = 40
+    classification_worker_count = 40
+    
+    print(f"CATEGORIZATION WORKERS: {categorization_worker_count}")
+    print(f"CLASSIFICATION WORKERS: {classification_worker_count}")
+    
+    # Start categorization workers immediately
+    from modal import Queue
+    categorization_queue = Queue.from_name(f"categorization-{execution_id}", create_if_missing=True)
+    
+    print(f"Starting {categorization_worker_count} categorization workers immediately...")
+    categorization_workers = []
+    for i in range(categorization_worker_count):
+        cat_worker = categorization_worker.spawn(execution_id, environment)
+        categorization_workers.append(cat_worker)
+    
+    # Start classification workers immediately for full overlap  
+    print(f"Starting {classification_worker_count} classification workers immediately...")
+    classification_workers = []
+    for i in range(classification_worker_count):
+        class_worker = classification_worker.spawn(execution_id, environment)
+        classification_workers.append(class_worker)
+        
+    print("Both stages now running in parallel from the start!")
+    print("Pipeline flow: CSV Products → Categorize → Classify (both simultaneous)")
+    
+    # Now create extraction data and queue for categorization as we go
+    print(f"Creating extraction data and queueing {len(df)} products for categorization...")
+    
+    for i, (_, row) in enumerate(df.iterrows()):
+        product_id = f'csv_product_{i+skip_rows:06d}'
+        
+        extraction_data = {
+            'product_id': product_id,
+            'name': str(row.get('name', 'Unknown Product')),
+            'description': str(row.get('description', '')),
+            'price': str(row.get('price', '')),
+            'brand': extract_brand_from_name(str(row.get('name', ''))),
+            'features': '',
+            'extracted_category': '',
+            'url': f"https://dermstore.com/products/{str(row.get('name', '')).lower().replace(' ', '-')[:50]}",
+            'status': 'success',
+            'source': 'csv_input',
+            'original_hsa_fsa_eligibility': str(row.get('hsa_fsa_eligibility', 'unknown')),
+            'execution_id': execution_id,
+            'csv_row_index': i + skip_rows
+        }
+        
+        # Save to S3
+        extraction_path = f"{environment}/{execution_id}/extraction/{product_id}.json"
+        s3_client.put_object(
+            Bucket='flex-ai',
+            Key=extraction_path,
+            Body=json.dumps(extraction_data, indent=2),
+            ContentType='application/json'
+        )
+        
+        # Queue for categorization immediately (so workers can start processing)
+        extraction_s3_path = f"{environment}/{execution_id}/extraction/{product_id}.json"
+        categorization_queue.put({
+            "product_id": product_id,
+            "s3_path": extraction_s3_path,
+            "stage": "categorization",
+            "execution_id": execution_id
+        })
+        
+        # Progress update every 1000 products
+        if (i + 1) % 1000 == 0:
+            print(f"   Created and queued {i + 1}/{len(df)} products...")
+    
+    print(f"Created and queued all {len(df)} products for processing!")
+    
+    # CSV "extraction" is complete - now signal categorization workers to finish (like main pipeline)
+    print("CSV extraction complete! Signaling categorization workers to finish...")
+    
+    # Signal categorization workers that extraction is complete (exactly like main pipeline)
+    for i in range(categorization_worker_count):
+        categorization_queue.put({
+            'product_id': 'EXTRACTION_COMPLETE',
+            'stage': 'categorization',
+            'execution_id': execution_id,
+            'signal': 'EXTRACTION_COMPLETE'
+        })
+    
+    print("Sent EXTRACTION_COMPLETE signals to all categorization workers")
+    
+    # Wait for categorization workers to complete (like main pipeline waits for extraction)
+    print("Waiting for categorization workers to complete...")
+    for worker in categorization_workers:
+        worker.get()  # This blocks until the worker completes
+    
+    print("All categorization workers completed! Signaling classification workers to finish...")
+    
+    # Signal classification workers that categorization is complete (exactly like main pipeline)
+    classification_queue_name = f"classification-{execution_id}"
+    for i in range(classification_worker_count):
+        classification_queue = Queue.from_name(classification_queue_name, create_if_missing=True)
+        classification_queue.put({
+            'product_id': 'CATEGORIZATION_COMPLETE',
+            'stage': 'classification',
+            'execution_id': execution_id,
+            'signal': 'CATEGORIZATION_COMPLETE'
+        })
+    
+    print("Sent CATEGORIZATION_COMPLETE signals to all classification workers")
+    
+    # Wait for classification workers to complete
+    print("Waiting for classification workers to complete...")
+    for worker in classification_workers:
+        worker.get()
+    
+    print("All workers completed! Both categorization and classification stages finished!")
+    
+    # STEP 4: Create final CSV
+    print(f"\nSTEP 4: Creating final CSV...")
+    
+    # Define output path
+    output_csv_path = f"s3://flex-ai/{environment}/{execution_id}/output/classified_products.csv"
+    
+    # Run CSV consolidation to create final output
+    try:
+        print(f"Running consolidation for execution {execution_id}...")
+        consolidation_result = consolidate_json_to_csv.remote(execution_id, "classification", environment)
+        
+        print(f"Final CSV created successfully!")
+        print(f"Output location: {output_csv_path}")
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'products_processed': len(df),
+            'final_csv_path': output_csv_path,
+            'consolidation_result': 'completed'
+        }
+        
+    except Exception as e:
+        print(f"Error creating final CSV: {e}")
+        return {
+            'status': 'error',
+            'execution_id': execution_id,
+            'environment': environment,
+            'products_processed': len(df),
+            'error': str(e),
+            'final_csv_path': output_csv_path
+        }
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,  # 24 hours
+    memory=4096,  # 4GB for large CSV processing
+    cpu=2
+)
+def reclassify_csv_products(
+    csv_file_path: str,
+    limit: int = 100,
+    environment: str = "dev",
+    execution_id: str = None
+):
+    """
+    Re-classify existing products from CSV using new HSA/FSA logic
+    Uses cascading queue architecture to handle large datasets (14K+ products)
+    
+    Pipeline flow: CSV Processing → Categorization → Classification
+    - Mimics main pipeline's cascading queue approach to avoid 5000 item queue limits
+    - Each stage feeds the next stage incrementally (1-by-1)
+    - Supports up to 50 workers per stage for maximum throughput
+    
+    Args:
+        csv_file_path: Path to CSV file with existing product data
+        limit: Number of products to process (for testing)
+        environment: dev or prod
+        execution_id: Unique execution ID
+    
+    Returns:
+        Dict with results. Output CSV = input CSV + 3 new columns:
+        - category: AI-determined product category
+        - eligibility_status: HSA/FSA eligibility (Eligible/Not Eligible/Requires LMN)
+        - rationale: Explanation for the eligibility decision
+    """
+    import uuid
+    import pandas as pd
+    import boto3
+    import json
+    import time
+    from io import StringIO
+    
+    if not execution_id:
+        execution_id = str(uuid.uuid4())[:8]
+    
+    print(f"CSV RE-CLASSIFICATION PIPELINE")  
+    print(f"Execution ID: {execution_id}")
+    print(f"CSV File: {csv_file_path}")
+    print(f"Limit: {limit} products")
+    print(f"Environment: {environment}")
+    print("=" * 80)
+    
+    try:
+        # Read CSV file (from S3 or local path)
+        print(f"Reading CSV file...")
+        
+        s3_client = boto3.client('s3')
+        
+        if csv_file_path.startswith('s3://'):
+            # Read from S3
+            bucket = csv_file_path.replace('s3://', '').split('/')[0]
+            key = '/'.join(csv_file_path.replace('s3://', '').split('/')[1:])
+            
+            print(f"Reading from S3: s3://{bucket}/{key}")
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+        else:
+            # Try to read as local file (for testing)
+            df = pd.read_csv(csv_file_path)
+        
+        if limit:
+            df = df.head(limit)
+            
+        print(f"Loaded {len(df)} products from CSV")
+        
+        # Convert CSV data to pipeline format with intelligent batching
+        print(f"Converting CSV data to pipeline format...")
+        
+        s3_client = boto3.client('s3')
+        
+        # Hardcode maximum workers for fastest processing
+        total_products = len(df)
+        categorization_workers = 50  # Maximum workers for speed
+        classification_workers = 50  # Maximum workers for speed
+        
+        print(f"Processing {total_products} products:")
+        print(f"   Categorization workers: {categorization_workers}")
+        print(f"   Classification workers: {classification_workers}")
+        print(f"   Batch processing: Initial batch={min(1000, total_products)}, Background batches=500 each")
+        
+        # Create cascading queues (mimic main pipeline)
+        from modal import Queue
+        csv_processing_queue = Queue.from_name(f"csv-processing-{execution_id}", create_if_missing=True)
+        categorization_queue = Queue.from_name(f"categorization-{execution_id}", create_if_missing=True)
+        classification_queue = Queue.from_name(f"classification-{execution_id}", create_if_missing=True)
+        
+        # Create lightweight CSV row references for queue (not full product data)
+        # Skip first 1000 rows that were already processed
+        skip_rows = 1000
+        csv_work_items = []
+        for i in range(skip_rows, total_products):  # Start from row 1000
+            csv_work_items.append({
+                'csv_row_index': i,
+                'product_id': f'csv_product_{i:06d}',
+                'execution_id': execution_id,
+                'environment': environment
+            })
+        
+        print(f"Skipping first {skip_rows} already processed rows")
+        print(f"Processing remaining {len(csv_work_items)} rows (from row {skip_rows} to {total_products-1})")
+        
+        # Process CSV work items in batches to avoid memory issues
+        batch_size = 1000  # Process 1000 products at a time
+        
+        # Queue first batch immediately to get workers started
+        initial_batch_size = min(1000, len(csv_work_items))
+        print(f"Queueing first {initial_batch_size} CSV work items to start workers...")
+        
+        for i in range(initial_batch_size):
+            csv_processing_queue.put(csv_work_items[i])
+            
+        # Start ALL workers immediately for maximum parallelism
+        print(f"Starting {min(10, categorization_workers)} CSV processing workers...")
+        csv_processing_workers = []
+        csv_worker_count = min(10, categorization_workers)
+        for i in range(csv_worker_count):
+            csv_worker = csv_processing_worker.spawn(execution_id, environment, csv_file_path)
+            csv_processing_workers.append(csv_worker)
+        
+        # Start categorization workers immediately
+        print(f"Starting {categorization_workers} categorization workers...")
+        categorization_worker_list = []
+        for i in range(categorization_workers):
+            cat_worker = categorization_worker.spawn(execution_id, environment)
+            categorization_worker_list.append(cat_worker)
+            
+        # Start classification workers immediately  
+        print(f"Starting {classification_workers} classification workers...")
+        classification_worker_list = []
+        for i in range(classification_workers):
+            class_worker = classification_worker.spawn(execution_id, environment)
+            classification_worker_list.append(class_worker)
+        
+        print("All 3 stages now running in parallel!")
+        
+        # Queue remaining items in background while workers are processing
+        print(f"Background queuing remaining {len(csv_work_items) - initial_batch_size} CSV work items...")
+        
+        if len(csv_work_items) > initial_batch_size:
+            remaining_batch_size = 500  # Queue 500 at a time to stay under limits
+            
+            for batch_start in range(initial_batch_size, len(csv_work_items), remaining_batch_size):
+                batch_end = min(batch_start + remaining_batch_size, len(csv_work_items))
+                batch = csv_work_items[batch_start:batch_end]
+                
+                # Queue this batch
+                for item in batch:
+                    csv_processing_queue.put(item)
+                
+                total_queued = batch_end
+                print(f"   Background queuing: {total_queued}/{len(csv_work_items)} CSV work items...")
+                
+                # Small delay between batches to avoid overwhelming the queue
+                time.sleep(0.1)
+        
+        print(f"All workers started! Processing {len(csv_work_items)} remaining products with full parallelism...")
+        
+        print("All 3 stages now running in parallel!")
+        print("Pipeline flow: CSV Processing → Categorize → Classify (all stages simultaneous)")
+        print("All stages process items as they flow through - no waiting between stages!")
+        
+        # Let all stages run in parallel and only wait at the very end
+        print("Monitoring progress... All 3 stages processing in parallel...")
+        
+        # Completion signals already added to queue after work items
+        
+        # Wait for CSV processing workers to complete (they feed the pipeline)
+        print("Waiting for CSV processing workers to complete...")
+        for worker in csv_processing_workers:
+            worker.get()
+        
+        print("CSV processing completed! Now signaling downstream stages to finish...")
+        
+        # Now send categorization completion signals  
+        for i in range(categorization_workers):
+            categorization_queue.put({
+                'product_id': 'EXTRACTION_COMPLETE',
+                'stage': 'categorization',
+                'execution_id': execution_id,
+                'signal': 'EXTRACTION_COMPLETE'
+            })
+        
+        # Wait for categorization workers to complete
+        print("Waiting for categorization workers to complete...")
+        for worker in categorization_worker_list:
+            worker.get()
+        
+        print("Categorization completed! Signaling classification workers...")
+        
+        # Send classification completion signals (revert to working approach)
+        for i in range(classification_workers):
+            classification_queue.put({
+                'product_id': 'CATEGORIZATION_COMPLETE',
+                'stage': 'classification',
+                'execution_id': execution_id,
+                'signal': 'CATEGORIZATION_COMPLETE'
+            })
+        
+        # Wait for classification workers to complete
+        print("Waiting for classification workers to complete...")
+        for worker in classification_worker_list:
+            worker.get()
+        
+        print("All workers completed!")
+        
+        # Create output CSV - copy of input with 3 new columns added
+        print(f"\nCreating output CSV (input + 3 new columns)...")
+        
+        # Read classification results
+        classification_prefix = f"{environment}/{execution_id}/classification/"
+        response = s3_client.list_objects_v2(
+            Bucket='flex-ai',
+            Prefix=classification_prefix
+        )
+        
+        classified_products = {}
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                if obj['Key'].endswith('.json'):
+                    try:
+                        product_data = download_product_from_s3(obj['Key'])
+                        csv_row_index = product_data.get('csv_row_index')
+                        if csv_row_index is not None:
+                            classified_products[csv_row_index] = product_data
+                    except Exception as e:
+                        print(f"Error reading {obj['Key']}: {e}")
+        
+        # Add new columns to original DataFrame
+        output_df = df.copy()
+        output_df['category'] = ''
+        output_df['eligibility_status'] = ''
+        output_df['rationale'] = ''
+        
+        # Fill in the new columns from classification results
+        processed_count = 0
+        for index, row in output_df.iterrows():
+            if index in classified_products:
+                product_data = classified_products[index]
+                output_df.at[index, 'category'] = product_data.get('primary_category', '')
+                output_df.at[index, 'eligibility_status'] = product_data.get('eligibility_status', '')
+                output_df.at[index, 'rationale'] = product_data.get('eligibility_rationale', '')
+                processed_count += 1
+        
+        # Save output CSV
+        output_key = f"{environment}/{execution_id}/output/dermstore_with_classifications.csv"
+        csv_buffer = StringIO()
+        output_df.to_csv(csv_buffer, index=False)
+        s3_client.put_object(
+            Bucket='flex-ai',
+            Key=output_key,
+            Body=csv_buffer.getvalue(),
+            ContentType='text/csv'
+        )
+        
+        # Calculate stats
+        total_products = len(output_df)
+        processed_products = processed_count
+        
+        print(f"\nRESULTS SUMMARY:")
+        print(f"   Total products in CSV: {total_products}")
+        print(f"   Products successfully classified: {processed_products}")
+        print(f"   Products not processed: {total_products - processed_products}")
+        print(f"   Output CSV: s3://flex-ai/{output_key}")
+        print(f"   Download URL: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={output_key}")
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'total_products': total_products,
+            'processed_products': processed_products,
+            'unprocessed_products': total_products - processed_products,
+            'output_csv_s3_path': f"s3://flex-ai/{output_key}",
+            'categorization_workers_used': categorization_workers,
+            'classification_workers_used': classification_workers
+        }
+        
+    except Exception as e:
+        print(f"CSV re-classification failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e),
+            'execution_id': execution_id
+        }
+
+def extract_brand_from_name(product_name: str) -> str:
+    """Extract brand name from product name"""
+    # Simple brand extraction - take first word or part before first comma/pipe
+    if not product_name:
+        return ''
+    
+    # Split by common separators
+    for separator in [' | ', ', ', ' - ', ' by ']:
+        if separator in product_name:
+            potential_brand = product_name.split(separator)[0].strip()
+            if len(potential_brand) < 50:  # Reasonable brand name length
+                return potential_brand
+    
+    # Fallback: first word
+    first_word = product_name.split()[0] if product_name.split() else ''
+    return first_word[:30]  # Limit length
+
+# =============================================================================
+# WEB API ENDPOINTS
+# =============================================================================
+
+@app.function(secrets=secrets)
+@modal.fastapi_endpoint(method="POST", docs=True)
+def api_run_pipeline(data: dict):
+    """
+    Run the complete product eligibility pipeline via REST API
+    
+    Expected JSON body:
+    {
+        "base_url": "https://example.com",
+        "max_products": 5,
+        "environment": "dev"
+    }
+    """
+    try:
+        base_url = data.get("base_url")
+        if not base_url:
+            return {"status": "error", "error": "base_url is required"}
+        
+        max_products = data.get("max_products", 50)
+        environment = data.get("environment", "dev")
+        
+        # Generate execution ID first
+        import time
+        execution_id = f"exec_{int(time.time())}"
+        
+        # Run the pipeline asynchronously (non-blocking) with our execution_id
+        pipeline_call = run_full_pipeline.spawn(base_url, max_products, environment, execution_id)
+        
+        return {
+            "status": "started",
+            "execution_id": execution_id,
+            "message": "Pipeline started successfully and running asynchronously",
+            "call_id": pipeline_call.object_id,
+            "monitor_s3": f"https://s3.console.aws.amazon.com/s3/buckets/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/",
+            "note": "Pipeline is running in the background. Check S3 for results or use call_id to monitor status."
+        }
+            
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.function()
+@modal.fastapi_endpoint(docs=True)
+def api_health():
+    """Health check endpoint"""
+    return {"status": "healthy", "app": "product-eligibility"}
+
+@app.function(secrets=[modal.Secret.from_name("aws-s3-credentials")])
+@modal.fastapi_endpoint(method="POST", docs=True)  
+def api_discovery(data: dict):
+    """Run discovery stage only"""
+    try:
+        base_url = data.get("base_url")
+        if not base_url:
+            return {"status": "error", "error": "base_url is required"}
+            
+        max_products = data.get("max_products", 50)
+        environment = data.get("environment", "dev")
+        execution_id = data.get("execution_id")
+        
+        result = discovery_stage.remote(base_url, max_products, environment, execution_id)
+        return {"status": result['status'], "result": result}
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+# =============================================================================
+# ORCHESTRATOR FUNCTIONS
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=secrets,
+    timeout=86400,  # 24 hours - maximum Modal allows
+    memory=2048     # 2GB memory for pipeline orchestration
+)
+def run_full_pipeline(
+    base_url: str,
+    max_products: int = 50,
+    environment: str = "dev",
+    execution_id: str = None,
+    discover_with_csv: str = None
+):
+    """
+    Run complete 5-stage pipeline
+    
+    Args:
+        base_url: E-commerce site URL
+        max_products: Maximum products to process
+        environment: dev or prod
+        discover_with_csv: Path to CSV file with product names (optional)
+    
+    Returns:
+        Dict with complete pipeline results
+    """
+    import uuid
+    if not execution_id:
+        execution_id = str(uuid.uuid4())[:8]
+    
+    print(f"STARTING FULL PRODUCT ELIGIBILITY PIPELINE")
+    print(f"EXECUTION ID: {execution_id}")
+    print(f"URL: {base_url}")
+    print(f"Max Products: {max_products}")
+    print(f"Environment: {environment}")
+    print(f"")
+    print(f"S3 LINKS:")
+    print(f"   Discovery: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/discovery/")
+    print(f"   Extraction: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/extraction/")
+    print(f"   Categorization: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/categorization/")
+    print(f"   Classification: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/classification/")
+    print(f"   Turbopuffer: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/turbopuffer/")
+    print(f"   Errors: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/error/")
+    print("=" * 80)
+    
+    pipeline_results = {}
+    
+    try:
+        # Stage 1: Discovery
+        print(f"\nRUNNING STAGE 1: DISCOVERY")
+        discovery_result = discovery_stage.remote(base_url, max_products, environment, execution_id=execution_id, discover_with_csv=discover_with_csv)
+        pipeline_results['discovery'] = discovery_result
+        
+        if discovery_result['status'] != 'success':
+            return {'status': 'failed', 'failed_at': 'discovery', 'results': pipeline_results}
+        
+        execution_id = discovery_result['execution_id']
+        
+        # Stages 2-4: Overlapping Extraction → Categorization → Classification
+        print(f"\nRUNNING OVERLAPPING STAGES 2-4: EXTRACTION → CATEGORIZATION → CLASSIFICATION")
+        extraction_result = extraction_stage.remote(execution_id, environment)
+        pipeline_results['extraction'] = extraction_result
+        pipeline_results['categorization'] = {'status': 'completed_in_overlap', 'message': 'Completed during extraction stage overlap'}
+        pipeline_results['classification'] = {'status': 'completed_in_overlap', 'message': 'Completed during extraction stage overlap'}
+        
+        if extraction_result['status'] != 'success':
+            return {'status': 'failed', 'failed_at': 'overlapping_stages', 'results': pipeline_results}
+        
+        # Stage 5: Turbopuffer (DISABLED - uncomment when ready)
+        # print(f"\nRUNNING STAGE 5: TURBOPUFFER")
+        # turbopuffer_result = turbopuffer_stage.remote(execution_id, environment)
+        # pipeline_results['turbopuffer'] = turbopuffer_result
+        print(f"\nSTAGE 5: TURBOPUFFER (SKIPPED - disabled for now)")
+        
+        print(f"\n" + "=" * 80)
+        print(f"PIPELINE COMPLETE!")
+        print(f"EXECUTION ID: {execution_id}")
+        print(f"Environment: {environment}")
+        print(f"")
+        print(f"FINAL S3 RESULTS:")
+        print(f"   Discovery Results: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/discovery/discovered_urls.csv")
+        print(f"   Extraction Results: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/extraction/extracted_products.csv")
+        print(f"   Categorization Results: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/categorization/categorized_products.csv")
+        print(f"   Classification Results: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/classification/classified_products.csv")
+        # print(f"   Turbopuffer Results: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/turbopuffer/uploaded_products.csv")  # DISABLED
+        print(f"   Error Reports: https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={environment}/{execution_id}/error/")
+        print(f"")
+        print(f"PIPELINE SUMMARY:")
+        for stage_name, stage_result in pipeline_results.items():
+            if isinstance(stage_result, dict) and 'status' in stage_result:
+                # Both 'success' and 'completed_in_overlap' are successful completions
+                is_success = stage_result['status'] in ['success', 'completed_in_overlap']
+                status_emoji = "PASS" if is_success else "FAIL"
+                print(f"   {status_emoji} {stage_name.title()}: {stage_result['status']}")
+        print(f"=" * 80)
+        
+        return {
+            'status': 'success',
+            'execution_id': execution_id,
+            'environment': environment,
+            'base_url': base_url,
+            'results': pipeline_results
+        }
+        
+    except Exception as e:
+        print(f"Pipeline failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e),
+            'results': pipeline_results
+        }
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-s3-credentials")],
+    timeout=86400,
+    memory=4096,  # 4GB memory for large dataset processing
+    cpu=2.0       # More CPU for faster processing
+)
+def consolidate_json_to_csv(execution_id: str, stage_name: str, environment: str = "dev"):
+    """
+    Consolidate individual JSON files into a single CSV for a completed stage
+    """
+    import boto3
+    import json
+    import pandas as pd
+    from io import StringIO
+    
+    print(f"Consolidating {stage_name} JSON files to CSV for execution {execution_id}")
+    
+    s3_client = boto3.client('s3')
+    
+    # Read all JSON files for this stage (handle pagination for large result sets)
+    stage_prefix = f"{environment}/{execution_id}/{stage_name}/"
+    
+    all_objects = []
+    continuation_token = None
+    
+    while True:
+        if continuation_token:
+            response = s3_client.list_objects_v2(
+                Bucket='flex-ai',
+                Prefix=stage_prefix,
+                ContinuationToken=continuation_token
+            )
+        else:
+            response = s3_client.list_objects_v2(
+                Bucket='flex-ai',
+                Prefix=stage_prefix
+            )
+        
+        if 'Contents' in response:
+            all_objects.extend(response['Contents'])
+        
+        if response.get('IsTruncated'):
+            continuation_token = response.get('NextContinuationToken')
+        else:
+            break
+    
+    print(f"Found {len(all_objects)} total files in S3")
+    
+    if not all_objects:
+        return {"status": "error", "message": f"No files found for {stage_name}"}
+    
+    processed_products = []
+    processed_count = 0
+    error_count = 0
+    
+    # Process JSON files in batches for better performance
+    json_objects = [obj for obj in all_objects if obj['Key'].endswith('.json')]
+    print(f"Processing {len(json_objects)} JSON files...")
+    
+    for obj in json_objects:
+        try:
+            # Download and parse each JSON file
+            obj_response = s3_client.get_object(Bucket='flex-ai', Key=obj['Key'])
+            product_data = json.loads(obj_response['Body'].read().decode('utf-8'))
+            processed_products.append(product_data)
+            processed_count += 1
+            
+            if processed_count % 500 == 0:
+                print(f"Processed {processed_count}/{len(json_objects)} JSON files... ({error_count} errors)")
+                
+        except Exception as e:
+            error_count += 1
+            if error_count % 100 == 0:
+                print(f"Errors so far: {error_count} (latest: {obj['Key']}: {e})")
+            continue
+    
+    print(f"Final result: {processed_count} successful, {error_count} errors")
+    
+    if not processed_products:
+        return {"status": "error", "message": f"No valid JSON files found for {stage_name}"}
+    
+    # Create DataFrame and CSV
+    results_df = pd.DataFrame(processed_products)
+    
+    # Set appropriate filename
+    if stage_name == 'classification':
+        csv_filename = 'classified_products.csv'
+    elif stage_name == 'categorization':
+        csv_filename = 'categorized_products.csv'  
+    elif stage_name == 'extraction':
+        csv_filename = 'extracted_products.csv'
+    else:
+        csv_filename = f'{stage_name}_products.csv'
+    
+    # Upload CSV to S3
+    results_key = f"{environment}/{execution_id}/{stage_name}/{csv_filename}"
+    csv_buffer = StringIO()
+    results_df.to_csv(csv_buffer, index=False)
+    s3_client.put_object(
+        Bucket='flex-ai',
+        Key=results_key,
+        Body=csv_buffer.getvalue(),
+        ContentType='text/csv'
+    )
+    
+    print(f"Successfully created {csv_filename} with {len(processed_products)} products")
+    
+    return {
+        "status": "success",
+        "stage": stage_name,
+        "execution_id": execution_id,
+        "products_processed": len(processed_products),
+        "csv_location": f"s3://flex-ai/{results_key}",
+        "download_url": f"https://s3.console.aws.amazon.com/s3/object/flex-ai?region=us-west-2&prefix={results_key}"
+    }
+
+@app.function(secrets=[modal.Secret.from_name("aws-s3-credentials")])
+@modal.fastapi_endpoint(method="POST", docs=True)
+def api_classification_stage(data: dict):
+    """
+    Run classification stage only via REST API
+    
+    Expected JSON body:
+    {
+        "execution_id": "f26757d2",
+        "environment": "dev"
+    }
+    
+    Returns:
+    {
+        "status": "started",
+        "execution_id": "f26757d2",
+        "function_call_id": "xyz789"
+    }
+    """
+    try:
+        execution_id = data.get("execution_id")
+        environment = data.get("environment", "dev")
+        
+        if not execution_id:
+            return {"error": "execution_id is required"}
+        
+        print(f"API: Starting classification stage for execution {execution_id}")
+        
+        # Run classification stage asynchronously
+        result = classification_stage.spawn(execution_id, environment)
+        
+        return {
+            "status": "started",
+            "execution_id": execution_id,
+            "environment": environment,
+            "function_call_id": result.object_id,
+            "message": f"Classification stage started for execution {execution_id}"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.function(secrets=[modal.Secret.from_name("aws-s3-credentials")])
+@modal.fastapi_endpoint(method="POST", docs=True)
+def api_consolidate_csv(data: dict):
+    """
+    Consolidate JSON files to CSV via REST API
+    
+    Expected JSON body:
+    {
+        "execution_id": "f26757d2",
+        "stage_name": "classification",
+        "environment": "dev"
+    }
+    
+    Returns:
+    {
+        "status": "started",
+        "execution_id": "f26757d2",
+        "function_call_id": "xyz789"
+    }
+    """
+    try:
+        execution_id = data.get("execution_id")
+        stage_name = data.get("stage_name", "classification")
+        environment = data.get("environment", "dev")
+        
+        if not execution_id:
+            return {"error": "execution_id is required"}
+        
+        print(f"API: Starting CSV consolidation for execution {execution_id}, stage {stage_name}")
+        
+        # Run consolidation asynchronously
+        result = consolidate_json_to_csv.spawn(execution_id, stage_name, environment)
+        
+        return {
+            "status": "started",
+            "execution_id": execution_id,
+            "stage_name": stage_name,
+            "environment": environment,
+            "function_call_id": result.object_id,
+            "message": f"CSV consolidation started for execution {execution_id}"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.function(secrets=[modal.Secret.from_name("aws-s3-credentials")])
+@modal.fastapi_endpoint(method="POST", docs=True)
+def api_reclassify_csv(data: dict):
+    """
+    Re-classify existing products from CSV using new HSA/FSA logic via REST API
+    
+    Expected JSON body:
+    {
+        "csv_file_path": "s3://flex-ai/input/dermstore.csv",
+        "limit": 100,
+        "environment": "dev"
+    }
+    
+    Returns:
+    {
+        "status": "started",
+        "execution_id": "abc123",
+        "function_call_id": "xyz789"
+    }
+    """
+    try:
+        csv_file_path = data.get("csv_file_path")
+        if not csv_file_path:
+            return {"status": "error", "error": "csv_file_path is required"}
+        
+        limit = data.get("limit")
+        environment = data.get("environment", "dev") 
+        execution_id = data.get("execution_id")
+        
+        print(f"API: Starting CSV reclassification for {csv_file_path}")
+        
+        # Run the CSV reclassification pipeline asynchronously
+        result = reclassify_csv_simple.spawn(
+            csv_file_path=csv_file_path,
+            limit=limit,
+            environment=environment,
+            execution_id=execution_id
+        )
+        
+        return {
+            "status": "started",
+            "message": "CSV reclassification pipeline started successfully",
+            "csv_file_path": csv_file_path,
+            "limit": limit,
+            "environment": environment,
+            "function_call_id": result.object_id,
+            "check_status_url": f"https://modal.com/functions/{result.object_id}"
+        }
+        
+    except Exception as e:
+        print(f"API Error: {e}")
+        return {"status": "error", "error": str(e)}
+
+@app.function()
+def health_check():
+    """Health check for product eligibility pipeline"""
+    return {
+        "status": "healthy", 
+        "app": "product-eligibility",
+        "stages": ["discovery", "extraction", "categorization", "classification", "turbopuffer"]
+    }
+
+if __name__ == "__main__":
+    print("Deploying Product Eligibility Pipeline...")
+    print("Individual Stage Functions:")
+    print("   • discovery_stage - Find product URLs")
+    print("   • extraction_stage - Extract product data")  
+    print("   • categorization_stage - Categorize products")
+    print("   • classification_stage - HSA/FSA eligibility")
+    print("   • turbopuffer_stage - Vector database upload (DISABLED)")
+    print("\nOrchestrator Functions:")
+    print("   • run_full_pipeline - Complete 5-stage pipeline")
+    print("   • health_check - System health")
+    print("\nReady for deployment!")
