@@ -1,8 +1,8 @@
-Classify this product into the most appropriate category from the list below:
+Classify this content into the most appropriate categories from the list below. Select up to 3 categories, ranked by relevance:
 
-Product: {{PRODUCT_NAME}}
+Content: {{PRODUCT_NAME}}
 Description: {{PRODUCT_DESCRIPTION}}
-Brand: {{PRODUCT_BRAND}}
+Components: {{PRODUCT_BRAND}}
 Features: {{PRODUCT_FEATURES}}
 
 Available Categories:
@@ -15,8 +15,18 @@ VALID CATEGORIES ONLY:
 
 If you use ANY category name not in the above list, the system will fail.
 
+INSTRUCTIONS:
+1. Select 1-3 categories that best match this content
+2. Rank them by relevance (primary = most relevant)
+3. If only 1 category fits, leave secondary/tertiary as empty strings ""
+4. If only 2 categories fit, leave tertiary as empty string ""
+5. Use exact category names from the list above
+
 Respond with JSON:
 {
     "primary_category": "MUST_BE_EXACT_MATCH_FROM_LIST_ABOVE",
-    "reasoning": "Brief explanation of why this category was chosen from the valid list",
+    "secondary_category": "SECOND_MOST_RELEVANT_OR_EMPTY_STRING",
+    "tertiary_category": "THIRD_MOST_RELEVANT_OR_EMPTY_STRING", 
+    "reasoning": "Brief explanation of why these categories were chosen from the valid list",
+    "confidence": 85
 }
